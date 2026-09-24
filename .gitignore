@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Scan workspace - captured frames and reconstructions are local artefacts
+scans/*
+!scans/.gitkeep
+
+# Locally configured COLMAP executable
+colmap_path.txt
+
+# Vendored COLMAP, if extracted into the project (root only - frontend/vendor/
+# holds the pinned Three.js build and must stay in the repo)
+/vendor/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

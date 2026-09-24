@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en" data-state="loading">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>3D Scanner</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#128248;</text></svg>" />
+<link rel="stylesheet" href="/static/styles.css" />
+<script type="importmap">
+{
+  "imports": {
+    "three": "/static/vendor/three.module.min.js",
+    "three/addons/": "/static/vendor/"
+  }
+}
+</script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-name">3D Scanner</span>
+    <span class="brand-sub">webcam photogrammetry</span>
+  </div>
+  <div class="status-cluster">
+    <span class="pill" id="pill-camera" data-ok="false">
+      <span class="dot"></span><span class="pill-label">Camera</span>
+    </span>
+    <span class="pill" id="pill-engine" data-ok="false">
+      <span class="dot"></span><span class="pill-label">3D Engine</span>
+    </span>
+    <button class="icon-btn" id="btn-settings" title="Settings" aria-label="Settings">
+      <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"></circle>
+        <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 8.9 19a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 5 8.9a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9.5a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9v.1a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"></path>
+      </svg>
+    </button>
+  </div>
+</header>
+
+<main class="stage">
+
+  <!-- ─────────────────────────── READY / SCANNING ─────────────────────────── -->
+  <section class="panel view" data-view="capture">
+    <div class="viewport" id="viewport">
+      <video id="preview" playsinline autoplay muted></video>
+      <canvas id="grabber" hidden></canvas>
+
+      <div class="viewport-empty" id="camera-empty" hidden>
+        <div class="empty-icon">
+          <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+            <path d="M23 7l-7 5 7 5V7z"></path><rect x="1" y="5" width="15" height="14" rx="2"></rect>
+          </svg>
+        </div>
+        <h3 id="camera-empty-title">No camera detected</h3>
+        <p id="camera-empty-body">Connect a webcam and try again.</p>
+        <button class="btn btn-ghost" id="btn-retry-camera">Retry</button>
+      </div>
+
+      <div class="scan-overlay" id="scan-overlay" hidden>
+        <div class="scanline"></div>
+        <div class="corner tl"></div><div class="corner tr"></div>
+        <div class="corner bl"></div><div class="corner br"></div>
+      </div>
+
+      <div class="viewport-badge" id="viewport-badge" hidden>
+        <span class="rec-dot"></span><span id="scan-timer">00:00</span>
+      </div>
+    </div>
+
+    <div class="capture-bar">
+      <!-- READY -->
+      <div class="capture-row" data-when="ready">
+        <label class="field">
+          <span class="field-label">Camera</span>
+          <select id="camera-select" class="select"></select>
+        </label>
+        <label class="field field-compact">
+          <span class="field-label">Scan quality</span>
+          <div class="segmented" id="preset-toggle" role="radiogroup" aria-label="Scan quality"></div>
+        </label>
+        <button class="btn btn-primary btn-lg" id="btn-start" disabled>
+          <span class="btn-dot"></span>Start Scan
+        </button>
+      </div>
+
+      <!-- SCANNING -->
+      <div class="capture-row capture-row-scan" data-when="scanning" hidden>
+        <div class="metric">
+          <span class="metric-value" id="scan-elapsed">00:00</span>
+          <span class="metric-label">elapsed</span>
+        </div>
+        <div class="metric">
+          <span class="metric-value" id="scan-frames">0</span>
+          <span class="metric-label">good frames</span>
+        </div>
+        <p class="guidance" id="scan-guidance">Move slowly around the subject and keep it visible.</p>
+        <button class="btn btn-primary btn-lg" id="btn-finish">Finish Scan</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─────────────────────────────── PROCESSING ─────────────────────────────── -->
+  <section class="panel view view-center" data-view="processing" hidden>
+    <div class="processing">
+      <h2 class="processing-title">Building your 3D map</h2>
+      <p class="processing-sub" id="processing-sub">This usually takes a minute or two.</p>
+
+      <ol class="stages" id="stage-list"></ol>
+
+      <div class="progress">
+        <div class="progress-fill" id="progress-fill"></div>
+      </div>
+      <div class="progress-meta">
+        <span id="progress-pct">0%</span>
+        <span id="progress-detail"></span>
+      </div>
+
+      <details class="tech">
+        <summary>Technical details</summary>
+        <pre id="tech-log" class="tech-log">Waiting for output…</pre>
+      </details>
+
+      <button class="btn btn-ghost btn-sm" id="btn-cancel">Cancel</button>
+    </div>
+  </section>
+
+  <!-- ──────────────────────────────── RESULT ──────────────────────────────── -->
+  <section class="panel view view-flush" data-view="result" hidden>
+    <div class="result-head">
+      <div class="result-title">
+        <span class="check" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"></path></svg>
+        </span>
+        Scan complete
+      </div>
+      <div class="result-tools">
+        <label class="slider-field">
+          <span>Point size</span>
+          <input type="range" id="point-size" min="0.4" max="4" step="0.1" value="1.4" />
+        </label>
+        <label class="check-field">
+          <input type="checkbox" id="show-cameras" checked />
+          <span>Camera path</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="canvas-wrap" id="canvas-wrap">
+      <canvas id="viewer-canvas"></canvas>
+      <div class="viewer-hint" id="viewer-hint">drag to rotate · scroll to zoom · right-drag to pan</div>
+      <div class="viewer-loading" id="viewer-loading">Loading point cloud…</div>
+    </div>
+
+    <div class="result-bar">
+      <div class="result-stats">
+        <span><strong id="stat-points">0</strong> points</span>
+        <span class="sep"></span>
+        <span><strong id="stat-images">0</strong> images reconstructed</span>
+        <span class="sep"></span>
+        <span><strong id="stat-time">0s</strong></span>
+      </div>
+      <div class="result-actions">
+        <button class="btn btn-ghost" id="btn-reset-view">Reset view</button>
+        <button class="btn btn-ghost" id="btn-export">Export .PLY</button>
+        <button class="btn btn-ghost" id="btn-open-folder">Scan folder</button>
+        <button class="btn btn-primary" id="btn-new-scan">New scan</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ───────────────────────────────── ERROR ───────────────────────────────── -->
+  <section class="panel view view-center" data-view="error" hidden>
+    <div class="error-card">
+      <div class="error-icon">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+          <path d="M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"></path>
+        </svg>
+      </div>
+      <h2 id="error-title">Something went wrong</h2>
+      <p id="error-message"></p>
+      <ul class="hints" id="error-hints"></ul>
+      <details class="tech" id="error-tech" hidden>
+        <summary>Technical details</summary>
+        <pre id="error-log" class="tech-log"></pre>
+      </details>
+      <div class="error-actions">
+        <button class="btn btn-ghost" id="btn-error-settings">Open settings</button>
+        <button class="btn btn-primary" id="btn-error-retry">Try again</button>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<!-- ──────────────────────────────── SETTINGS ──────────────────────────────── -->
+<div class="modal-backdrop" id="settings-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal-head">
+      <h3 id="settings-title">Settings</h3>
+      <button class="icon-btn" id="btn-close-settings" aria-label="Close">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"></path></svg>
+      </button>
+    </div>
+
+    <div class="modal-body">
+      <section class="setting">
+        <h4>Reconstruction engine</h4>
+        <p class="setting-status" id="engine-status">Checking…</p>
+        <div class="input-row">
+          <input type="text" class="input" id="colmap-path" placeholder="C:\COLMAP\COLMAP.bat" spellcheck="false" />
+          <button class="btn btn-ghost btn-sm" id="btn-save-colmap">Use</button>
+          <button class="btn btn-ghost btn-sm" id="btn-detect-colmap">Re-detect</button>
+        </div>
+        <p class="setting-note" id="engine-note"></p>
+        <details class="tech">
+          <summary>Searched locations</summary>
+          <pre id="engine-searched" class="tech-log"></pre>
+        </details>
+      </section>
+
+      <section class="setting">
+        <h4>Developer · import images</h4>
+        <p class="setting-note">
+          Reconstruct from a folder of existing photos instead of a live scan. Useful for testing
+          without a webcam.
+        </p>
+        <div class="input-row">
+          <input type="text" class="input" id="import-folder" placeholder="C:\path\to\images" spellcheck="false" />
+          <button class="btn btn-ghost btn-sm" id="btn-import">Reconstruct</button>
+        </div>
+        <p class="setting-note" id="import-note"></p>
+      </section>
+
+      <section class="setting">
+        <h4>About</h4>
+        <p class="setting-note">
+          Structure-from-motion from a single webcam. There is no depth sensor involved, so the
+          result is a sparse point cloud without true real-world scale. Everything runs locally —
+          nothing is uploaded.
+        </p>
+        <p class="setting-note" id="about-versions"></p>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

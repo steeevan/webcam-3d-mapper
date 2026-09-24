@@ -1,0 +1,7 @@
+# Development / test dependencies
+-r requirements.txt
+pytest>=8.0
+httpx>=0.27
+
+# Optional: headless browser UI smoke test (scripts/ui_smoke.py)
+# playwright>=1.45   -> then: python -m playwright install chromium
