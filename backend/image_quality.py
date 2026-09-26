@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import numpy as np
 
 from . import config
 from .models import FrameDecision
+from .tracking import TrackingEstimator
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,7 @@ class _Metrics:
     blur: float
     brightness: float
     thumbnail: np.ndarray
+    gray_small: np.ndarray
 
 
 def _measure(image_bgr: np.ndarray) -> _Metrics:
@@ -47,7 +50,7 @@ def _measure(image_bgr: np.ndarray) -> _Metrics:
     thumbnail = cv2.resize(gray, config.THUMBNAIL_SIZE, interpolation=cv2.INTER_AREA).astype(
         np.float32
     )
-    return _Metrics(blur=blur, brightness=brightness, thumbnail=thumbnail)
+    return _Metrics(blur=blur, brightness=brightness, thumbnail=thumbnail, gray_small=gray_small)
 
 
 def decode_jpeg(data: bytes) -> np.ndarray | None:
@@ -59,8 +62,23 @@ def decode_jpeg(data: bytes) -> np.ndarray | None:
     return image
 
 
+def make_thumbnail(source: Path, target: Path, width: int) -> bool:
+    """Write a downscaled JPEG copy of ``source``. Returns False if it cannot be read."""
+    image = cv2.imread(str(source), cv2.IMREAD_COLOR)
+    if image is None:
+        return False
+    scale = min(1.0, width / image.shape[1])
+    small = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return bool(cv2.imwrite(str(target), small, [int(cv2.IMWRITE_JPEG_QUALITY), 82]))
+
+
 class FrameQualityFilter:
-    """Stateful per-scan filter. Holds only the last accepted thumbnail, not whole frames."""
+    """Stateful per-scan filter. Holds only the last accepted thumbnail, not whole frames.
+
+    Every frame, kept or not, is also shown to the tracking estimator so the capture screen
+    can say *why* a scan is heading for trouble while there is still time to fix it.
+    """
 
     def __init__(
         self,
@@ -75,15 +93,21 @@ class FrameQualityFilter:
         self.similarity_threshold = similarity_threshold
         self._previous_thumbnail: np.ndarray | None = None
         self._accepted = 0
+        self.tracker = TrackingEstimator()
 
     def evaluate(self, image_bgr: np.ndarray) -> FrameDecision:
         """Score one frame and, if accepted, remember it as the new reference."""
         metrics = _measure(image_bgr)
+        decision = self._decide(metrics)
+        decision.tracking = self.tracker.observe(metrics.gray_small, decision.accepted)
+        return decision
+
+    def _decide(self, metrics: _Metrics) -> FrameDecision:
 
         if metrics.brightness < self.dark_threshold:
             return FrameDecision(False, "dark", metrics.blur, metrics.brightness)
         if metrics.brightness > self.bright_threshold:
-            return FrameDecision(False, "dark", metrics.blur, metrics.brightness)
+            return FrameDecision(False, "bright", metrics.blur, metrics.brightness)
 
         # Blur is checked before novelty so a soft frame is reported as blurry rather than
         # being swallowed by the duplicate test (a blurred frame resembles its neighbour).
@@ -112,3 +136,4 @@ class FrameQualityFilter:
     def reset(self) -> None:
         self._previous_thumbnail = None
         self._accepted = 0
+        self.tracker.reset()

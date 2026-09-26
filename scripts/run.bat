@@ -58,14 +58,19 @@ if "%NEEDS_INSTALL%"=="1" (
 
 REM --- COLMAP notice --------------------------------------------------------
 REM Detection happens in the app; this is only a friendly heads-up.
-where colmap >nul 2>&1 || where COLMAP.bat >nul 2>&1 || (
-  if not exist "C:\COLMAP\COLMAP.bat" (
-    echo   [!] COLMAP was not found on PATH.
-    echo       Scanning will work, but reconstruction needs COLMAP:
-    echo       https://github.com/colmap/colmap/releases  ^(download the -windows-no-cuda zip^)
-    echo       Then set the path in the app's Settings panel, or set COLMAP_PATH.
-    echo.
-  )
+set "HAVE_COLMAP=0"
+if exist "vendor\colmap\COLMAP.bat" set "HAVE_COLMAP=1"
+if exist "C:\COLMAP\COLMAP.bat" set "HAVE_COLMAP=1"
+if defined COLMAP_PATH set "HAVE_COLMAP=1"
+if exist "colmap_path.txt" set "HAVE_COLMAP=1"
+where colmap >nul 2>&1 && set "HAVE_COLMAP=1"
+where COLMAP.bat >nul 2>&1 && set "HAVE_COLMAP=1"
+if "%HAVE_COLMAP%"=="0" (
+  echo   [!] COLMAP was not found.
+  echo       Scanning will work, but reconstruction needs COLMAP. To download the right
+  echo       build for this computer ^(CUDA if it has an NVIDIA GPU^), run:
+  echo         .venv\Scripts\python scripts\get_colmap.py
+  echo.
 )
 
 echo   Starting server on http://127.0.0.1:8765

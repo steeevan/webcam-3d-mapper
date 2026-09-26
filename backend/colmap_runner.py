@@ -111,8 +111,26 @@ def _candidate_paths() -> list[tuple[Path, str]]:
     return candidates
 
 
-def _probe(executable: Path) -> tuple[bool, str]:
-    """Run ``<exe> -h`` and return (looks_like_colmap, combined output)."""
+#: Windows exit codes (NTSTATUS) that mean "the file is there but was not allowed or able to
+#: start", worth telling the user about instead of "not found".
+_START_FAILURES = {
+    0xC0E90002: "Windows blocked it (Smart App Control or an application control policy)",
+    0xC0000135: "a DLL it needs is missing",
+    0xC000007B: "a DLL it needs is the wrong architecture",
+    0xC0000022: "Windows denied access to it",
+}
+
+
+def describe_start_failure(returncode: int | None) -> str | None:
+    """Plain-language reason for a Windows start-up failure code, or None if not one."""
+    if returncode is None:
+        return None
+    reason = _START_FAILURES.get(returncode & 0xFFFFFFFF)
+    return f"{reason} (exit code 0x{returncode & 0xFFFFFFFF:08X})" if reason else None
+
+
+def _probe(executable: Path) -> tuple[bool, str, int | None]:
+    """Run ``<exe> -h``: (looks_like_colmap, combined output, exit code or None)."""
     try:
         completed = subprocess.run(
             [str(executable), "-h"],
@@ -123,11 +141,11 @@ def _probe(executable: Path) -> tuple[bool, str]:
             creationflags=_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return False, str(exc)
+        return False, str(exc), None
 
     output = f"{completed.stdout}\n{completed.stderr}"
     usable = "feature_extractor" in output or "COLMAP" in output
-    return usable, output
+    return usable, output, completed.returncode
 
 
 def _detect_gpu() -> str:
@@ -156,6 +174,8 @@ class ColmapRunner:
         self._info: ColmapInfo | None = None
         self._option_cache: dict[str, set[str]] = {}
         self._gpu: str | None = None
+        #: Set when a GPU stage failed; later runs on this server stay on the CPU.
+        self.gpu_failed = False
 
     # -- discovery ------------------------------------------------------------
 
@@ -167,9 +187,12 @@ class ColmapRunner:
         if force:
             self._option_cache.clear()
             self._executable = None
+            self.gpu_failed = False
 
         searched: list[str] = []
         seen: set[str] = set()
+        #: Candidates that exist but would not start, with the reason.
+        blocked: list[str] = []
 
         for path, source in _candidate_paths():
             key = str(path).lower()
@@ -181,9 +204,14 @@ class ColmapRunner:
             if not path.exists() or path.is_dir():
                 continue
 
-            usable, output = _probe(path)
+            usable, output, returncode = _probe(path)
             if not usable:
-                logger.debug("Rejected COLMAP candidate %s", path)
+                reason = describe_start_failure(returncode)
+                if reason:
+                    blocked.append(f"{path}: {reason}")
+                    logger.warning("COLMAP at %s could not start: %s", path, reason)
+                else:
+                    logger.debug("Rejected COLMAP candidate %s", path)
                 continue
 
             match = _VERSION_RE.search(output)
@@ -210,7 +238,11 @@ class ColmapRunner:
             available=False,
             gpu=self._gpu,
             searched=searched,
-            error="No COLMAP executable found on PATH or in the standard install locations.",
+            error=(
+                "COLMAP was found but could not start: " + "; ".join(blocked)
+                if blocked
+                else "No COLMAP executable found on PATH or in the standard install locations."
+            ),
         )
         logger.warning("COLMAP not found. Searched %d locations.", len(searched))
         return self._info
@@ -234,9 +266,14 @@ class ColmapRunner:
                 raise ColmapNotFoundError(f"No COLMAP executable inside {candidate}")
             candidate = resolved
 
-        usable, _ = _probe(candidate)
+        usable, _, returncode = _probe(candidate)
         if not usable:
-            raise ColmapNotFoundError(f"{candidate} does not look like a COLMAP executable.")
+            reason = describe_start_failure(returncode)
+            raise ColmapNotFoundError(
+                f"{candidate} could not start: {reason}"
+                if reason
+                else f"{candidate} does not look like a COLMAP executable."
+            )
 
         config.COLMAP_PATH_FILE.write_text(str(candidate), encoding="utf-8")
         return self.detect(force=True)
@@ -364,17 +401,43 @@ class ColmapRunner:
             await asyncio.wait_for(pump(), timeout=timeout)
             returncode = await asyncio.wait_for(process.wait(), timeout=60)
         except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+            await _kill_tree(process)
             raise ColmapCommandError(command, -1, "\n".join(tail[-20:]) + "\n[timed out]")
         except asyncio.CancelledError:
-            process.kill()
-            await process.wait()
+            await _kill_tree(process)
             raise
 
         if returncode != 0:
             raise ColmapCommandError(command, returncode, "\n".join(tail[-20:]))
         return "\n".join(tail)
+
+
+async def _kill_tree(process: asyncio.subprocess.Process) -> None:
+    """Stop a COLMAP run *and its children*.
+
+    On Windows COLMAP is launched through ``COLMAP.bat``, so ``process`` is ``cmd.exe`` and the
+    real work happens in a child ``colmap.exe``. ``process.kill()`` alone ends only the shell:
+    measured here, the orphaned mapper kept a CPU core busy for another ~20 s after "cancel".
+    ``taskkill /T`` takes the whole tree down.
+    """
+    if process.returncode is None and os.name == "nt":
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=15,
+                check=False,
+                creationflags=_NO_WINDOW,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover
+            logger.warning("taskkill failed for pid %s: %s", process.pid, exc)
+    if process.returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:  # pragma: no cover - exited in between
+            pass
+    await process.wait()
 
 
 #: Module-level singleton; detection is cheap after the first call.

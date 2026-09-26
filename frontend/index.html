@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>3D Scanner</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#128248;</text></svg>" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><path d='M16 3l11 6.5v13L16 29 5 22.5v-13z' fill='none' stroke='%233be8b0' stroke-width='2.4' stroke-linejoin='round'/><path d='M16 16l11-6.5M16 16v13M16 16L5 9.5' stroke='%233be8b0' stroke-width='1.6' opacity='.55'/></svg>" />
 <link rel="stylesheet" href="/static/styles.css" />
 <script type="importmap">
 {
@@ -17,9 +17,15 @@
 </head>
 <body>
 
+<div class="backdrop" aria-hidden="true"></div>
+
 <header class="topbar">
   <div class="brand">
-    <span class="brand-mark" aria-hidden="true"></span>
+    <svg class="brand-mark" viewBox="0 0 32 32" width="22" height="22" aria-hidden="true">
+      <path class="cube-edge" d="M16 3l11 6.5v13L16 29 5 22.5v-13z" />
+      <path class="cube-inner" d="M16 16l11-6.5M16 16v13M16 16L5 9.5" />
+      <circle class="cube-dot" cx="16" cy="16" r="1.8" />
+    </svg>
     <span class="brand-name">3D Scanner</span>
     <span class="brand-sub">webcam photogrammetry</span>
   </div>
@@ -30,6 +36,11 @@
     <span class="pill" id="pill-engine" data-ok="false">
       <span class="dot"></span><span class="pill-label">3D Engine</span>
     </span>
+    <button class="icon-btn" id="btn-library" title="Scan library" aria-label="Toggle scan library" aria-pressed="true">
+      <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M15 4v16"></path>
+      </svg>
+    </button>
     <button class="icon-btn" id="btn-settings" title="Settings" aria-label="Settings">
       <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="3"></circle>
@@ -39,6 +50,7 @@
   </div>
 </header>
 
+<div class="shell" id="shell" data-library="open">
 <main class="stage">
 
   <!-- ─────────────────────────── READY / SCANNING ─────────────────────────── -->
@@ -46,6 +58,7 @@
     <div class="viewport" id="viewport">
       <video id="preview" playsinline autoplay muted></video>
       <canvas id="grabber" hidden></canvas>
+      <canvas id="feature-layer" class="feature-layer"></canvas>
 
       <div class="viewport-empty" id="camera-empty" hidden>
         <div class="empty-icon">
@@ -64,22 +77,66 @@
         <div class="corner bl"></div><div class="corner br"></div>
       </div>
 
+      <div class="hud" id="hud" hidden data-tone="neutral">
+        <div class="hud-head">
+          <span class="hud-label">Tracking</span>
+          <span class="hud-state" id="hud-state">Locking on…</span>
+        </div>
+        <div class="meter" id="meter" aria-hidden="true"></div>
+        <div class="hud-stats">
+          <span><b id="hud-features">0</b> features</span>
+          <span><b id="hud-links">0</b> links</span>
+          <span class="hud-board" id="hud-board" data-on="false" title="Markers of the printed scale board in this frame">no board</span>
+        </div>
+      </div>
+
       <div class="viewport-badge" id="viewport-badge" hidden>
         <span class="rec-dot"></span><span id="scan-timer">00:00</span>
       </div>
+
+      <!-- Live 3D preview + coverage guide, fed by a background COLMAP round every ~15 s. -->
+      <aside class="live" id="live" hidden aria-label="Live 3D preview">
+        <div class="live-card" id="live-map" data-state="collecting" data-tone="neutral">
+          <div class="live-head">
+            <span class="hud-label">Live map</span>
+            <span class="live-age" id="live-age"></span>
+          </div>
+          <div class="live-canvas">
+            <canvas id="live-canvas"></canvas>
+            <p class="live-empty" id="live-empty">Collecting frames…</p>
+          </div>
+          <p class="live-placed" id="live-placed">–</p>
+        </div>
+        <div class="live-card" id="live-coverage" data-state="waiting">
+          <div class="live-head">
+            <span class="hud-label">Coverage</span>
+            <span class="live-age" id="coverage-age"></span>
+          </div>
+          <svg class="compass" id="compass" viewBox="-60 -60 120 120" aria-hidden="true"></svg>
+          <p class="live-note" id="coverage-note">Waiting for first preview</p>
+        </div>
+      </aside>
+
+      <div class="filmstrip" id="filmstrip" aria-hidden="true"></div>
     </div>
 
-    <div class="capture-bar">
+    <div class="capture-bar glass">
       <!-- READY -->
       <div class="capture-row" data-when="ready">
         <label class="field">
           <span class="field-label">Camera</span>
           <select id="camera-select" class="select"></select>
         </label>
-        <label class="field field-compact">
+        <div class="field field-compact">
           <span class="field-label">Scan quality</span>
           <div class="segmented" id="preset-toggle" role="radiogroup" aria-label="Scan quality"></div>
-        </label>
+        </div>
+        <div class="field field-compact">
+          <span class="field-label">Find</span>
+          <button class="btn btn-ghost record-pending" id="btn-record-pending" type="button" title="Find number, site, context and material for the next scan">
+            <span id="pending-record-label">Add find record</span>
+          </button>
+        </div>
         <button class="btn btn-primary btn-lg" id="btn-start" disabled>
           <span class="btn-dot"></span>Start Scan
         </button>
@@ -95,7 +152,15 @@
           <span class="metric-value" id="scan-frames">0</span>
           <span class="metric-label">good frames</span>
         </div>
-        <p class="guidance" id="scan-guidance">Move slowly around the subject and keep it visible.</p>
+        <div class="metric metric-placed" id="metric-placed" data-tone="neutral">
+          <span class="metric-value" id="scan-placed">–</span>
+          <span class="metric-label">placed in 3D</span>
+        </div>
+        <div class="metric">
+          <span class="metric-value" id="scan-score">–</span>
+          <span class="metric-label">tracking</span>
+        </div>
+        <p class="guidance" id="scan-guidance" data-tone="neutral">Move slowly around the subject and keep it visible.</p>
         <button class="btn btn-primary btn-lg" id="btn-finish">Finish Scan</button>
       </div>
     </div>
@@ -103,7 +168,11 @@
 
   <!-- ─────────────────────────────── PROCESSING ─────────────────────────────── -->
   <section class="panel view view-center" data-view="processing" hidden>
-    <div class="processing">
+    <div class="mosaic" id="mosaic" aria-hidden="true"></div>
+    <div class="processing glass">
+      <div class="orbit" aria-hidden="true">
+        <span></span><span></span><span></span>
+      </div>
       <h2 class="processing-title">Building your 3D map</h2>
       <p class="processing-sub" id="processing-sub">This usually takes a minute or two.</p>
 
@@ -130,10 +199,11 @@
   <section class="panel view view-flush" data-view="result" hidden>
     <div class="result-head">
       <div class="result-title">
-        <span class="check" aria-hidden="true">
+        <span class="check" id="result-check" aria-hidden="true">
           <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"></path></svg>
         </span>
-        Scan complete
+        <span id="result-name">Scan complete</span>
+        <span class="verdict" id="result-verdict" hidden></span>
       </div>
       <div class="result-tools">
         <label class="slider-field">
@@ -142,26 +212,40 @@
         </label>
         <label class="check-field">
           <input type="checkbox" id="show-cameras" checked />
-          <span>Camera path</span>
+          <span>Cameras</span>
         </label>
+        <label class="check-field">
+          <input type="checkbox" id="auto-rotate" checked />
+          <span>Spin</span>
+        </label>
+        <button class="btn btn-ghost btn-sm" id="btn-measure" aria-pressed="false" hidden title="Click two points of the cloud to measure the distance between them">Measure</button>
       </div>
     </div>
 
     <div class="canvas-wrap" id="canvas-wrap">
       <canvas id="viewer-canvas"></canvas>
+      <div class="result-warning" id="result-warning" hidden></div>
+      <div class="scale-badge" id="scale-badge" hidden></div>
+      <div class="measure-readout" id="measure-readout" hidden></div>
+      <div class="scale-bar" id="scale-bar" hidden title="Length at the orbit centre; nearer points look bigger">
+        <i id="scale-bar-line"></i><span id="scale-bar-label"></span>
+      </div>
       <div class="viewer-hint" id="viewer-hint">drag to rotate · scroll to zoom · right-drag to pan</div>
-      <div class="viewer-loading" id="viewer-loading">Loading point cloud…</div>
+      <div class="viewer-loading" id="viewer-loading"><span class="spinner"></span>Loading point cloud…</div>
     </div>
 
     <div class="result-bar">
       <div class="result-stats">
         <span><strong id="stat-points">0</strong> points</span>
         <span class="sep"></span>
-        <span><strong id="stat-images">0</strong> images reconstructed</span>
+        <span><strong id="stat-images">0</strong> images placed</span>
         <span class="sep"></span>
         <span><strong id="stat-time">0s</strong></span>
+        <div class="timeline" id="timeline" title="Tracking quality across the capture"></div>
       </div>
       <div class="result-actions">
+        <button class="btn btn-ghost" id="btn-record">Find record</button>
+        <button class="btn btn-ghost" id="btn-report" title="Two-page PDF: views, photo, record, capture log">Find report</button>
         <button class="btn btn-ghost" id="btn-reset-view">Reset view</button>
         <button class="btn btn-ghost" id="btn-export">Export .PLY</button>
         <button class="btn btn-ghost" id="btn-open-folder">Scan folder</button>
@@ -170,9 +254,46 @@
     </div>
   </section>
 
+  <!-- ─────────────────────────────── COMPARE ─────────────────────────────── -->
+  <section class="panel view view-flush" data-view="compare" hidden>
+    <div class="result-head">
+      <div class="result-title">Compare scans</div>
+      <div class="result-tools">
+        <label class="check-field" title="Orbit and zoom both views together, each relative to its own model">
+          <input type="checkbox" id="compare-sync" checked />
+          <span>Sync orbit</span>
+        </label>
+        <button class="btn btn-ghost btn-sm" id="btn-compare-reset">Reset views</button>
+        <button class="btn btn-ghost btn-sm" id="btn-compare-close">Close</button>
+      </div>
+    </div>
+
+    <div class="compare-views">
+      <div class="compare-pane" data-side="a">
+        <div class="canvas-wrap"><canvas id="compare-canvas-a"></canvas>
+          <div class="viewer-loading" id="compare-loading-a"><span class="spinner"></span>Loading…</div>
+        </div>
+        <span class="compare-label" id="compare-label-a">A</span>
+      </div>
+      <div class="compare-pane" data-side="b">
+        <div class="canvas-wrap"><canvas id="compare-canvas-b"></canvas>
+          <div class="viewer-loading" id="compare-loading-b"><span class="spinner"></span>Loading…</div>
+        </div>
+        <span class="compare-label" id="compare-label-b">B</span>
+      </div>
+    </div>
+
+    <div class="compare-table-wrap">
+      <table class="compare-table" id="compare-table">
+        <thead><tr><th></th><th id="compare-head-a">A</th><th id="compare-head-b">B</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
   <!-- ───────────────────────────────── ERROR ───────────────────────────────── -->
   <section class="panel view view-center" data-view="error" hidden>
-    <div class="error-card">
+    <div class="error-card glass">
       <div class="error-icon">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
           <path d="M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"></path>
@@ -193,6 +314,27 @@
   </section>
 
 </main>
+
+<!-- ──────────────────────────────── LIBRARY ──────────────────────────────── -->
+<aside class="library glass" id="library" aria-label="Scan library">
+  <div class="library-head">
+    <h3>Library</h3>
+    <span class="library-count" id="library-count">0</span>
+    <button class="btn btn-ghost btn-xs" id="btn-compare" aria-pressed="false" title="Pick two finished scans to view side by side">Compare</button>
+  </div>
+  <div class="library-search">
+    <input type="search" class="input" id="library-search" placeholder="Find no., site, context, material" aria-label="Search the library by find record" maxlength="200" spellcheck="false" />
+  </div>
+  <p class="library-pick" id="library-pick" hidden>Pick two finished scans to compare.</p>
+  <div class="library-list" id="library-list"></div>
+  <div class="library-empty" id="library-empty" hidden>
+    <svg viewBox="0 0 32 32" width="34" height="34" aria-hidden="true">
+      <path d="M16 3l11 6.5v13L16 29 5 22.5v-13z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" />
+    </svg>
+    <p id="library-empty-text">Finished scans appear here. Click one to reopen it in the viewer.</p>
+  </div>
+</aside>
+</div>
 
 <!-- ──────────────────────────────── SETTINGS ──────────────────────────────── -->
 <div class="modal-backdrop" id="settings-modal" hidden>
@@ -221,6 +363,29 @@
       </section>
 
       <section class="setting">
+        <h4>Marker board · real-world scale</h4>
+        <p class="setting-note">
+          A webcam alone cannot measure size. Print the board, put the find in the middle and scan
+          around it: the markers' known size gives the model millimetres. Print at 100% and check
+          the 100&nbsp;mm bar with a ruler.
+        </p>
+        <div class="input-row board-links">
+          <a class="btn btn-ghost btn-sm" href="/api/marker-board.pdf?paper=a4" target="_blank" rel="noopener">Board · A4</a>
+          <a class="btn btn-ghost btn-sm" href="/api/marker-board.pdf?paper=letter" target="_blank" rel="noopener">Board · Letter</a>
+        </div>
+        <label class="field marker-size-field">
+          <span class="field-label">Printed marker size (edge of a black square)</span>
+          <div class="input-row">
+            <input type="number" class="input" id="marker-size" min="10" max="60" step="0.1" placeholder="30.0" />
+            <span class="unit">mm</span>
+            <button class="btn btn-ghost btn-sm" id="btn-marker-size" type="button">Save</button>
+            <button class="btn btn-ghost btn-sm" id="btn-remeasure" type="button" hidden>Re-measure open scan</button>
+          </div>
+        </label>
+        <p class="setting-note" id="marker-note"></p>
+      </section>
+
+      <section class="setting">
         <h4>Developer · import images</h4>
         <p class="setting-note">
           Reconstruct from a folder of existing photos instead of a live scan. Useful for testing
@@ -237,13 +402,67 @@
         <h4>About</h4>
         <p class="setting-note">
           Structure-from-motion from a single webcam. There is no depth sensor involved, so the
-          result is a sparse point cloud without true real-world scale. Everything runs locally —
-          nothing is uploaded.
+          result is a sparse point cloud with real-world scale only when the printed marker board
+          was in view. Everything runs locally — nothing is uploaded.
         </p>
         <p class="setting-note" id="about-versions"></p>
       </section>
     </div>
   </div>
+</div>
+
+<!-- ─────────────────────────────── FIND RECORD ─────────────────────────────── -->
+<div class="modal-backdrop" id="record-modal" hidden>
+  <form class="modal record-modal" id="record-form" role="dialog" aria-modal="true" aria-labelledby="record-title" novalidate>
+    <div class="modal-head">
+      <h3 id="record-title">Find record</h3>
+      <button class="icon-btn" id="btn-close-record" type="button" aria-label="Close">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"></path></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <p class="setting-note" id="record-context"></p>
+      <div class="record-grid">
+        <label class="field">
+          <span class="field-label">Find number <b class="req">required</b></span>
+          <input class="input" name="findNumber" autocomplete="off" spellcheck="false" required />
+        </label>
+        <label class="field">
+          <span class="field-label">Site code</span>
+          <input class="input" name="siteCode" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="field">
+          <span class="field-label">Context / unit</span>
+          <input class="input" name="context" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="field">
+          <span class="field-label">Material</span>
+          <select class="select" name="material" id="record-material"></select>
+        </label>
+        <label class="field record-other" id="record-other" hidden>
+          <span class="field-label">Material, described</span>
+          <input class="input" name="materialOther" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span class="field-label">Date found</span>
+          <input class="input" type="date" name="dateFound" />
+        </label>
+        <label class="field">
+          <span class="field-label">Recorder</span>
+          <input class="input" name="recorder" autocomplete="name" />
+        </label>
+        <label class="field record-notes">
+          <span class="field-label">Notes</span>
+          <textarea class="input" name="notes" rows="4"></textarea>
+        </label>
+      </div>
+      <p class="form-error" id="record-error" role="alert" hidden></p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost btn-sm" id="btn-record-clear" type="button">Clear</button>
+      <button class="btn btn-primary btn-sm" id="btn-record-save" type="submit">Save record</button>
+    </div>
+  </form>
 </div>
 
 <div class="toast" id="toast" hidden></div>

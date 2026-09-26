@@ -6,9 +6,10 @@ One scan == one directory under ``scans/``. The filesystem *is* the database:
         images/          frame_000001.jpg ...
         database.db      COLMAP feature/match database
         sparse/          COLMAP models (0/, 1/, ...)
+        preview/         live-preview workspace (own database, models, per-round output)
         result/          map.ply, cameras.json
         logs/colmap.log  raw COLMAP output
-        scan.json        status + statistics
+        scan.json        status, statistics, find record, capture details, scale
 
 Scan IDs are validated against a strict pattern before ever touching a path, and every
 resolved path is checked to be inside ``scans/`` — nothing a browser sends can escape the
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import secrets
 import shutil
@@ -28,6 +30,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from . import config
+from .find_record import clean_text, load_record, record_matches
 from .image_quality import FrameQualityFilter
 from .models import (
     STAGE_PROGRESS,
@@ -69,10 +72,25 @@ class ScanSession:
         self.stage_detail: str = ""
         self.progress: int = 0
         self.source: str = "webcam"
+        #: One entry per accepted frame: ``[tracking score, state]``, for the result timeline.
+        self.timeline: list[list[Any]] = []
+        #: The find record (see find_record.py), or None if nobody has filled one in.
+        self.record: dict[str, str] | None = None
+        #: Measured at capture: the browser's camera label and the pixel size of the frames.
+        self.capture: dict[str, Any] = {}
+        #: COLMAP version that built the model, for the capture log.
+        self.colmap_version: str | None = None
+        #: Printed marker size to use for scaling; None means the board's nominal size.
+        self.marker_size_mm: float | None = None
+        #: Outcome of the marker-board scale estimate (see scale.py), or None if never run.
+        self.scale: dict[str, Any] | None = None
 
         # Capture-time state, never persisted.
         self.quality_filter = FrameQualityFilter()
         self._next_frame_index = 1
+        #: Names of frames that are completely on disk, in capture order. The live preview
+        #: hands exactly this list to COLMAP, never a directory listing.
+        self.frame_names: list[str] = []
 
     # -- paths ----------------------------------------------------------------
 
@@ -111,6 +129,11 @@ class ScanSession:
     @property
     def manifest_path(self) -> Path:
         return self.root / "scan.json"
+
+    @property
+    def preview_dir(self) -> Path:
+        """Live-preview workspace. Nothing in here is read by the final reconstruction."""
+        return self.root / "preview"
 
     # -- mutation --------------------------------------------------------------
 
@@ -158,15 +181,38 @@ class ScanSession:
         self._next_frame_index += 1
         return path
 
+    def write_frame(self, data: bytes) -> Path:
+        """Store an accepted frame so that no reader ever sees it half written.
+
+        The live preview runs COLMAP on this folder while capture is still writing to it. The
+        bytes go to a ``.tmp`` name that ``frame_*.jpg`` does not match, then an atomic rename
+        publishes the finished file.
+        """
+        path = self.next_frame_path()
+        partial = path.with_name(path.name + ".tmp")
+        try:
+            partial.write_bytes(data)
+            os.replace(partial, path)
+        except OSError:
+            partial.unlink(missing_ok=True)
+            raise
+        self.frame_names.append(path.name)
+        return path
+
     def record_decision(self, decision: FrameDecision) -> None:
         self.stats.captured += 1
         if decision.accepted:
             self.stats.accepted += 1
+            if decision.tracking:
+                state = decision.tracking.state
+                self.stats.weak_links += state == "lost"
+                self.stats.rotation_frames += state == "rotating"
+                self.timeline.append([decision.tracking.score, state])
         elif decision.reason == "blurry":
             self.stats.rejected_blurry += 1
         elif decision.reason == "duplicate":
             self.stats.rejected_duplicate += 1
-        elif decision.reason == "dark":
+        elif decision.reason in ("dark", "bright"):
             self.stats.rejected_dark += 1
         else:
             self.stats.rejected_error += 1
@@ -199,6 +245,12 @@ class ScanSession:
             "updatedAt": self.updated_at,
             "elapsedProcessing": round(self.elapsed_processing, 1),
             "hasPly": self.ply_path.exists(),
+            "timeline": self.timeline,
+            "record": self.record,
+            "capture": self.capture,
+            "colmapVersion": self.colmap_version,
+            "markerSizeMm": self.marker_size_mm,
+            "scale": self.scale,
         }
 
     def save(self) -> None:
@@ -237,6 +289,17 @@ class ScanSession:
         session.source = str(data.get("source", "webcam"))
         session.created_at = float(data.get("createdAt", time.time()))
         session.updated_at = float(data.get("updatedAt", session.created_at))
+        session.timeline = [list(entry) for entry in data.get("timeline") or []]
+        # Scans made before find records, capture details or scaling existed have none of these.
+        session.record = load_record(data.get("record"))
+        capture = data.get("capture")
+        session.capture = dict(capture) if isinstance(capture, dict) else {}
+        version = data.get("colmapVersion")
+        session.colmap_version = str(version) if version else None
+        size = data.get("markerSizeMm")
+        session.marker_size_mm = float(size) if isinstance(size, (int, float)) and size > 0 else None
+        scale = data.get("scale")
+        session.scale = scale if isinstance(scale, dict) else None
 
         if data.get("result"):
             session.result = ReconstructionResult(**data["result"])
@@ -245,6 +308,7 @@ class ScanSession:
 
         existing = sorted(session.images_dir.glob("frame_*.jpg")) if session.images_dir.exists() else []
         session._next_frame_index = len(existing) + 1
+        session.frame_names = [path.name for path in existing]
         return session
 
 
@@ -275,7 +339,15 @@ class ScanManager:
 
     # -- lifecycle -----------------------------------------------------------------
 
-    def create(self, preset: str = config.DEFAULT_PRESET, source: str = "webcam") -> ScanSession:
+    def create(
+        self,
+        preset: str = config.DEFAULT_PRESET,
+        source: str = "webcam",
+        record: dict[str, str] | None = None,
+        camera: str = "",
+        marker_size_mm: float | None = None,
+    ) -> ScanSession:
+        """Start a scan. ``record`` must already be validated (``validate_record``)."""
         if preset not in config.PRESETS:
             preset = config.DEFAULT_PRESET
 
@@ -287,6 +359,11 @@ class ScanManager:
         root = self.scans_dir / scan_id
         session = ScanSession(scan_id, root, preset)
         session.source = source
+        session.record = record
+        session.marker_size_mm = marker_size_mm
+        camera = clean_text(camera)[:120]
+        if camera:
+            session.capture["camera"] = camera
         for directory in (session.images_dir, session.sparse_dir, session.result_dir, session.logs_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -313,14 +390,23 @@ class ScanManager:
         shutil.rmtree(root, ignore_errors=True)
         logger.info("Deleted scan %s", scan_id)
 
-    def list_scans(self, limit: int = 20) -> list[dict[str, Any]]:
-        """Most recent scans first. Directory names sort chronologically by construction."""
+    def list_scans(self, limit: int = 20, query: str = "") -> list[dict[str, Any]]:
+        """Most recent scans first. Directory names sort chronologically by construction.
+
+        With a ``query``, every scan on disk is searched by its find record (find number, site,
+        context, material), not just the most recent ``limit``.
+        """
         entries: list[dict[str, Any]] = []
-        for root in sorted(self._iter_scan_dirs(), reverse=True)[:limit]:
+        for root in sorted(self._iter_scan_dirs(), reverse=True):
+            if len(entries) >= limit:
+                break
             try:
-                entries.append(self.get(root.name).to_dict())
+                session = self.get(root.name)
             except (ScanNotFoundError, InvalidScanIdError):
                 continue
+            if query and not record_matches(session.record, query):
+                continue
+            entries.append(session.to_dict())
         return entries
 
     def _iter_scan_dirs(self) -> Iterator[Path]:

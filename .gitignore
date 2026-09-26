@@ -10,6 +10,9 @@ venv/
 scans/*
 !scans/.gitkeep
 
+# Synthetic test scenes and screenshots (see README > Development)
+.cache/
+
 # Locally configured COLMAP executable
 colmap_path.txt
 
