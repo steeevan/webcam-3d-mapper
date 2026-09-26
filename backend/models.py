@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .tracking import TrackingSample
 
 
 class ScanStatus(str, Enum):
@@ -71,6 +74,10 @@ class FrameStats:
     rejected_duplicate: int = 0
     rejected_dark: int = 0
     rejected_error: int = 0
+    #: Accepted frames whose views no longer overlapped the recent past (tracking "lost").
+    weak_links: int = 0
+    #: Accepted frames captured while the camera was only rotating (no parallax).
+    rotation_frames: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -113,6 +120,7 @@ class FrameDecision:
     blur: float = 0.0
     brightness: float = 0.0
     difference: float = 0.0
+    tracking: TrackingSample | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -121,4 +129,5 @@ class FrameDecision:
             "blur": round(self.blur, 2),
             "brightness": round(self.brightness, 2),
             "difference": round(self.difference, 3),
+            "tracking": self.tracking.to_dict() if self.tracking else None,
         }
