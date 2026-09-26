@@ -114,6 +114,10 @@ class QualityPreset:
     #: Together they roughly doubled the point count on a real 56-frame webcam scan
     #: (2,441 -> 4,606) for ~2.2x the time. Dense stereo would do far more but needs CUDA.
     refined_features: bool = False
+    #: Longest side of the undistorted images the optional dense stage works on (see
+    #: DENSE_* below). Patch-match cost grows with the pixel count: for a 1280x720 webcam
+    #: frame, Fast works on a quarter of the pixels Detailed does (Detailed keeps full size).
+    dense_max_image_size: int = 1024
     hint: str = ""
 
     @property
@@ -129,6 +133,7 @@ PRESETS: dict[str, QualityPreset] = {
         max_num_features=4096,
         sequential_overlap=5,
         mapper_ba_global_images_ratio=1.4,
+        dense_max_image_size=640,
         hint="quickest preview",
     ),
     "balanced": QualityPreset(
@@ -138,6 +143,7 @@ PRESETS: dict[str, QualityPreset] = {
         max_num_features=8192,
         sequential_overlap=10,
         mapper_ba_global_images_ratio=1.1,
+        dense_max_image_size=1024,
         hint="about 2x slower",
     ),
     "detailed": QualityPreset(
@@ -148,6 +154,7 @@ PRESETS: dict[str, QualityPreset] = {
         sequential_overlap=12,
         mapper_ba_global_images_ratio=1.1,
         refined_features=True,
+        dense_max_image_size=1600,
         hint="densest cloud, about 3x slower",
     ),
 }
@@ -179,3 +186,16 @@ COLMAP_EXE_NAMES: tuple[str, ...] = ("COLMAP.bat", "colmap.exe", "colmap")
 
 #: A COLMAP process that produces no output for this long is considered hung.
 COLMAP_STAGE_TIMEOUT_S: float = 60 * 60
+
+# --- Optional dense cloud (NVIDIA GPU only, see reconstruction.py) ---------------------
+# image_undistorter -> patch_match_stereo -> stereo_fusion, after the sparse scan is complete.
+# COLMAP's patch_match_stereo only exists in CUDA builds; a CPU-only build stops with "Dense
+# stereo reconstruction requires CUDA", so the stage is never attempted there.
+
+#: Each of the three dense stages is stopped (and the scan kept, sparse only) after this long.
+DENSE_STAGE_TIMEOUT_S: float = 60 * 60
+#: Neighbouring views patch-match compares each image with (COLMAP's default is 20).
+DENSE_SOURCE_IMAGES: int = 20
+#: A dense cloud is only trusted for measuring when the undistorted model's camera centres
+#: match the sparse model's to this fraction of the camera spread (it should be float noise).
+DENSE_FRAME_TOLERANCE: float = 1e-6

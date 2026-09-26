@@ -30,11 +30,15 @@ from .ortho import (
     upright_rotation,
     yaw_alignment,
 )
-from .pdf import A4_MM, PdfDocument
-from .reconstruction import read_camera_centers, read_point_stats, read_points3d
+from .pdf import A4_MM, PT_PER_MM, PdfDocument
+from .reconstruction import read_camera_centers, read_ply_points, read_point_stats, read_points3d
 
 NOT_RECORDED = "not recorded"
 _LOG_VERSION_RE = re.compile(r"\(version ([0-9][\w.]*)\)")
+
+#: A dense cloud can hold millions of points; the views splat an evenly strided subset, which
+#: at 88 mm x 8 px/mm is still several points per pixel for a find filling the view.
+REPORT_MAX_POINTS = 400_000
 
 GREY = (0.45, 0.45, 0.45)
 LIGHT = (0.85, 0.85, 0.85)
@@ -44,6 +48,37 @@ WARN = (0.7, 0.2, 0.1)
 def _model_dir(session):
     index = session.result.model_index if session.result else None
     return session.sparse_dir / str(index) if index is not None else None
+
+
+def dense_for_views(session) -> bool:
+    """Draw the report from ``dense.ply``? Only when it exists and its own run confirmed it is
+    in the sparse model's frame, so the marker scale and board pose apply to it unchanged."""
+    dense = session.dense or {}
+    return (
+        dense.get("status") == "complete"
+        and dense.get("sameFrame") is True
+        and session.dense_ply_path.is_file()
+    )
+
+
+def dense_summary(dense: dict[str, Any] | None) -> str | None:
+    """The capture log's "Dense cloud" line; None when none was asked for."""
+    dense = dense or {}
+    status = dense.get("status")
+    if status == "complete":
+        text = (
+            f"{dense.get('points', 0):,} points (COLMAP patch-match stereo, images at most "
+            f"{dense.get('maxImageSize')} px, {dense.get('totalSeconds', 0):.0f} s)"
+        )
+        if dense.get("sameFrame") is not True:
+            text += "; not used for the views: its cameras did not match the sparse model"
+        return text
+    if status in ("failed", "cancelled", "unavailable"):
+        label = {"failed": "failed", "cancelled": "cancelled", "unavailable": "not available"}[status]
+        return f"{label}: {dense.get('reason') or 'no reason recorded'}"
+    if status:
+        return "still running"
+    return None
 
 
 def _colmap_version(session) -> str | None:
@@ -104,6 +139,8 @@ def capture_log(session, point_stats: dict[str, float] | None = None) -> dict[st
         "markersUsed": scale.get("markersUsed"),
         "scaleFramesUsed": scale.get("framesUsed"),
         "markerSizeMm": scale.get("markerSizeMm"),
+        "densePoints": (session.dense or {}).get("points") if dense_for_views(session) else None,
+        "dense": dense_summary(session.dense),
     }
 
 
@@ -173,11 +210,22 @@ def _photo(session) -> tuple[bytes, int, int, str] | None:
 
 
 def _upright_points(session) -> tuple[np.ndarray, np.ndarray, str, bool]:
-    """Selected cloud in the upright, yaw-aligned frame; millimetres when scaled."""
+    """Selected cloud in the upright, yaw-aligned frame; millimetres when scaled.
+
+    The dense cloud when there is a trusted one, otherwise the sparse points. Both are in the
+    same model frame, so the upright rotation (from the sparse cameras), the board pose and
+    the scale are the same either way.
+    """
     model_dir = _model_dir(session)
     if model_dir is None:
         return np.zeros((0, 3)), np.zeros((0, 3), np.uint8), "no model", False
-    xyz, rgb = read_points3d(model_dir)
+    if dense_for_views(session):
+        xyz, rgb = read_ply_points(session.dense_ply_path)
+        if len(xyz) > REPORT_MAX_POINTS:
+            step = -(-len(xyz) // REPORT_MAX_POINTS)
+            xyz, rgb = xyz[::step], rgb[::step]
+    else:
+        xyz, rgb = read_points3d(model_dir)
     scale = session.scale or {}
     chosen, how = find_points(xyz, scale)
     xyz, rgb = xyz[chosen], rgb[chosen]
@@ -250,6 +298,7 @@ def build_report(session, version: str, generated: datetime | None = None) -> by
     y += 4
 
     points, colours, how, scaled = _upright_points(session)
+    dense = dense_for_views(session)
     cell_w, cell_h = 87.0, 104.0
     image_w, image_h = 87.0, 88.0
     layout = choose_layout(points, (image_w, image_h), scaled)
@@ -268,6 +317,7 @@ def build_report(session, version: str, generated: datetime | None = None) -> by
         image = render_view(
             points, colours, view, layout,
             (round(image_w * px_per_mm), round(image_h * px_per_mm)), px_per_mm,
+            radius_px=1 if dense else 2,
         )
         doc.image_rgb(page, image, x, cy + 5, image_w, image_h)
         page.rect(x, cy + 5, image_w, image_h, stroke=LIGHT, width=0.2)
@@ -279,7 +329,11 @@ def build_report(session, version: str, generated: datetime | None = None) -> by
     on_sheet = "on the sheet" in how
     page.paragraph(
         15, note_y,
-        f"Orthographic views of the sparse point cloud ({len(points):,} {how}). Up is the "
+        f"Orthographic views of the {'dense' if dense else 'sparse'} point cloud "
+        f"({len(points):,} {how}"
+        + (f", an even subset of the {(session.dense or {}).get('points', 0):,} dense points"
+           if dense and len(points) < (session.dense or {}).get("points", 0) else "")
+        + "). Up is the "
         "average camera up during the scan; the longest horizontal axis runs left to right. "
         "Only surfaces the camera saw are reconstructed"
         + (": the underside of a find lying on the sheet is missing, so the bottom view shows "
@@ -340,12 +394,16 @@ def build_report(session, version: str, generated: datetime | None = None) -> by
         ("Frames", f"{log['framesCaptured']} captured, {log['framesAccepted']} accepted"),
         ("Placed in 3D", f"{placed} of {log['framesAccepted']} accepted frames" if placed is not None else None),
         ("Points", f"{log['points']:,}" if log["points"] is not None else None),
+        *([("Dense cloud", log["dense"])] if log["dense"] else []),
         ("Mean reprojection error", _fmt(log["meanReprojectionErrorPx"], 3, " px")),
         ("Mean track length", _fmt(log["meanTrackLength"], 2, " views per point")),
         ("Reconstruction time", _fmt(log["reconstructionSeconds"], 0, " s")),
     ]
     for label, value in entries:
         page.text(15, y, label, 8, color=GREY)
+        if label == "Dense cloud":  # the only entry long enough to wrap: one row per line
+            y = page.paragraph(60, y, value, 135, size=8.5, leading=4.6 * PT_PER_MM / 8.5)
+            continue
         page.text(60, y, value if value not in (None, "") else NOT_RECORDED, 8.5,
                   color=(0, 0, 0) if value not in (None, "", NOT_RECORDED) else GREY)
         y += 4.6

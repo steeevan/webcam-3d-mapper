@@ -2270,3 +2270,427 @@ def test_a_blocked_colmap_is_reported_as_blocked_not_missing(tmp_path, monkeypat
     monkeypatch.setattr(colmap_runner, "_probe", lambda path: (False, "not colmap", 0))
     assert ColmapRunner().detect().error.startswith("No COLMAP executable found")
     assert colmap_runner.describe_start_failure(1) is None
+
+
+# --------------------------------------------------------------------------------------
+# Dense cloud (NVIDIA GPU, opt-in)
+# --------------------------------------------------------------------------------------
+
+#: The dense options as ``colmap <command> -h`` lists them in COLMAP 3.8 and 3.11.1 (CUDA
+#: builds; the CPU-only 3.x builds print no patch_match_stereo options at all).
+DENSE_OPTIONS_V3 = {
+    "image_path", "input_path", "output_path", "output_type", "image_list_path",
+    "copy_policy", "num_patch_match_src_images", "max_image_size",
+    "workspace_path", "workspace_format", "pmvs_option_name", "config_path",
+    "PatchMatchStereo.max_image_size", "PatchMatchStereo.gpu_index",
+    "PatchMatchStereo.geom_consistency", "PatchMatchStereo.filter",
+    "PatchMatchStereo.num_iterations", "PatchMatchStereo.window_radius",
+    "input_type", "bbox_path", "StereoFusion.max_image_size", "StereoFusion.min_num_pixels",
+    "StereoFusion.num_threads", "StereoFusion.check_num_images",
+}
+
+#: The same in COLMAP 4.2.0, identical in the CUDA and the CPU-only build: the names used
+#: here are unchanged; 4.2 adds PatchMatchStereo.num_threads and drops --bbox_path.
+DENSE_OPTIONS_V4 = (DENSE_OPTIONS_V3 - {"bbox_path"}) | {"PatchMatchStereo.num_threads"}
+
+
+def dense_pipeline(tmp_path, preset: str = "fast", options=None, **runner_kwargs) -> ReconstructionPipeline:
+    manager = ScanManager(tmp_path / "scans")
+    runner = FakeRunner(options=OPTIONS_V4 | DENSE_OPTIONS_V4 if options is None else options,
+                        **runner_kwargs)
+    return ReconstructionPipeline(manager.create(preset=preset, dense=True), runner=runner)
+
+
+@pytest.mark.parametrize(
+    ("preset", "size"), [("fast", 640), ("balanced", 1024), ("detailed", 1600)]
+)
+def test_dense_arguments_follow_the_preset(tmp_path, preset, size):
+    """Fast works on a quarter of Detailed's pixels for a 1280x720 frame, so it stays quick."""
+    pipeline = dense_pipeline(tmp_path, preset)
+    session = pipeline.session
+    model = session.sparse_dir / "0"
+
+    undistort = pipeline.image_undistorter_args(model)
+    assert value_of(undistort, "input_path") == str(model)
+    assert value_of(undistort, "image_path") == str(session.images_dir)
+    assert value_of(undistort, "output_path") == str(session.dense_dir)
+    assert value_of(undistort, "output_type") == "COLMAP"
+    assert value_of(undistort, "max_image_size") == str(size)
+
+    stereo = pipeline.patch_match_stereo_args()
+    assert value_of(stereo, "workspace_path") == str(session.dense_dir)
+    assert value_of(stereo, "PatchMatchStereo.geom_consistency") == "1"
+    assert value_of(stereo, "PatchMatchStereo.max_image_size") == str(size)
+
+    fusion = pipeline.stereo_fusion_args()
+    assert value_of(fusion, "input_type") == "geometric"
+    assert value_of(fusion, "output_type") == "PLY"
+    assert value_of(fusion, "output_path") == str(session.dense_dir / "fused.ply")
+    assert value_of(fusion, "StereoFusion.max_image_size") == str(size)
+
+
+@pytest.mark.parametrize("options", [DENSE_OPTIONS_V3, DENSE_OPTIONS_V4], ids=["colmap-3.x", "colmap-4.x"])
+def test_dense_options_resolve_on_both_generations(tmp_path, options):
+    """Every dense option the app passes exists under the same name in 3.8, 3.11.1 and 4.2."""
+    pipeline = dense_pipeline(tmp_path, options=options)
+    argv = [
+        *pipeline.image_undistorter_args(pipeline.session.sparse_dir / "0"),
+        *pipeline.patch_match_stereo_args(),
+        *pipeline.stereo_fusion_args(),
+    ]
+    names = [token[2:] for token in argv if token.startswith("--")]
+    assert set(names) <= options
+    assert len(names) == 16  # nothing was dropped
+    assert "--bbox_path" not in argv and "--PatchMatchStereo.num_threads" not in argv
+
+
+def test_dense_options_a_build_lacks_are_dropped(tmp_path):
+    """An undistorter without max_image_size still gets the size through the later stages."""
+    options = OPTIONS_V4 | (DENSE_OPTIONS_V4 - {"max_image_size", "num_patch_match_src_images"})
+    pipeline = dense_pipeline(tmp_path, options=options)
+    undistort = pipeline.image_undistorter_args(pipeline.session.sparse_dir / "0")
+    assert "--max_image_size" not in undistort and "--num_patch_match_src_images" not in undistort
+    assert value_of(pipeline.patch_match_stereo_args(), "PatchMatchStereo.max_image_size") == "640"
+
+
+def write_dense_ply(path: Path, xyz: np.ndarray, crlf: bool = False) -> None:
+    """A PLY laid out as stereo_fusion writes it (WriteBinaryPlyPoints): xyz, normals, rgb."""
+    nl = "\r\n" if crlf else "\n"
+    names = ["x", "y", "z", "nx", "ny", "nz"]
+    header = nl.join(
+        ["ply", "format binary_little_endian 1.0", f"element vertex {len(xyz)}"]
+        + [f"property float {name}" for name in names]
+        + [f"property uchar {name}" for name in ("red", "green", "blue")]
+        + ["end_header"]
+    ) + nl
+    dtype = np.dtype([(name, "<f4") for name in names] + [(c, "u1") for c in ("red", "green", "blue")])
+    records = np.zeros(len(xyz), dtype=dtype)
+    records["x"], records["y"], records["z"] = xyz.T
+    records["nz"] = -1.0
+    records["red"] = 200
+    path.write_bytes(header.encode() + records.tobytes())
+
+
+def test_dense_ply_is_read_with_a_windows_header(tmp_path):
+    from backend.reconstruction import ply_vertex_count, read_ply_points
+
+    xyz = np.random.default_rng(3).normal(size=(50, 3))
+    write_dense_ply(tmp_path / "dense.ply", xyz, crlf=True)
+    assert ply_vertex_count(tmp_path / "dense.ply") == 50
+    points, colours = read_ply_points(tmp_path / "dense.ply")
+    np.testing.assert_allclose(points, xyz, atol=1e-6)
+    assert (colours[:, 0] == 200).all() and (colours[:, 1] == 0).all()
+
+    (tmp_path / "text.ply").write_bytes(b"ply\nformat ascii 1.0\nelement vertex 0\nend_header\n")
+    with pytest.raises(ValueError):
+        read_ply_points(tmp_path / "text.ply")
+
+
+class DenseRunner(FakeRunner):
+    """Plays every stage: the sparse ones with a ground-truth model, the dense ones with the
+    files COLMAP would write. ``fail`` maps a command to the error it raises; ``hang`` makes
+    patch_match_stereo wait until cancelled."""
+
+    def __init__(self, scene: Path, fail: dict | None = None, hang: bool = False,
+                 fused_points: int = 500, move_cameras: bool = False, **kwargs) -> None:
+        kwargs.setdefault("gpu", "NVIDIA RTX 4070")
+        super().__init__(options=OPTIONS_V4 | DENSE_OPTIONS_V4, **kwargs)
+        self.scene, self.fail, self.hang = scene, fail or {}, hang
+        self.fused_points, self.move_cameras = fused_points, move_cameras
+        self.started = None
+
+    async def run(self, command, args, log_sink=None, line_callback=None, timeout=0):  # type: ignore[override]
+        import asyncio
+        import shutil
+
+        self.calls.append((command, list(args)))
+        self.timeouts = getattr(self, "timeouts", {})
+        self.timeouts[command] = timeout
+        if command in self.fail:
+            raise self.fail[command]
+        if command == "mapper":
+            shutil.copytree(self.scene / "model", Path(value_of(args, "output_path")) / "0")
+        elif command == "model_converter":
+            write_dense_ply(Path(value_of(args, "output_path")), np.zeros((3, 3)))
+        elif command == "image_undistorter":
+            out = Path(value_of(args, "output_path"))
+            shutil.copytree(value_of(args, "input_path"), out / "sparse")
+            if self.move_cameras:  # a model that is not the sparse one
+                poses = read_camera_centers(out / "sparse")
+                write_images_bin(out / "sparse" / "images.bin", [
+                    ((1, 0, 0, 0), (index * 5.0, 0, 0), camera["name"])
+                    for index, camera in enumerate(poses)
+                ])
+            (out / "stereo" / "depth_maps").mkdir(parents=True)
+            for line in ("Undistorting image [1/2]", "Undistorting image [2/2]"):
+                line_callback(line)
+        elif command == "patch_match_stereo":
+            depth = Path(value_of(args, "workspace_path")) / "stereo" / "depth_maps"
+            (depth / "frame_000001.jpg.geometric.bin").write_bytes(b"\0" * 4096)
+            line_callback("Processing view 1 / 2 for frame_000001.jpg")
+            if self.hang:
+                self.started.set()
+                await asyncio.Event().wait()
+            for line in ("Processing view 2 / 2 for frame_000002.jpg",
+                         "Processing view 1 / 2 for frame_000001.jpg"):
+                line_callback(line)
+        elif command == "stereo_fusion":
+            line_callback("Fusing image [1/2] with index 0")
+            out = Path(value_of(args, "output_path"))
+            write_dense_ply(out, np.random.default_rng(0).normal(size=(self.fused_points, 3)))
+            Path(f"{out}.vis").write_bytes(b"\0" * 64)
+        return ""
+
+
+def dense_scan(tmp_path, scene: Path, preset: str = "fast", dense: bool = True) -> ScanSession:
+    import shutil
+
+    session = ScanManager(tmp_path / "scans").create(preset=preset, dense=dense)
+    for frame in sorted(scene.glob("frame_*.jpg")):
+        shutil.copyfile(frame, session.images_dir / frame.name)
+    return session
+
+
+def assert_intact_sparse_scan(session: ScanSession) -> None:
+    """What a dense problem must never touch: status, result, sparse cloud, scale."""
+    assert session.status is ScanStatus.COMPLETE and session.error is None
+    assert session.result.model_index == 0 and session.ply_path.is_file()
+    assert session.scale["status"] == "scaled"
+    stored = json.loads(session.manifest_path.read_text())
+    assert stored["status"] == "complete" and stored["error"] is None
+    assert not session.dense_dir.exists()  # workspace removed in every case
+    assert not session.dense_ply_path.exists()
+
+
+def test_a_dense_run_writes_dense_ply_in_the_sparse_frame(tmp_path, find_scene):
+    folder, _ = find_scene
+    session = dense_scan(tmp_path, folder)
+    runner = DenseRunner(folder, fused_points=700)
+    run_async(ReconstructionPipeline(session, runner=runner).run())
+
+    commands = [command for command, _ in runner.calls]
+    assert commands[-3:] == ["image_undistorter", "patch_match_stereo", "stereo_fusion"]
+    assert commands.index("image_undistorter") > commands.index("model_converter")
+    assert runner.timeouts["patch_match_stereo"] == config.DENSE_STAGE_TIMEOUT_S
+    assert session.status is ScanStatus.COMPLETE
+    dense = session.dense
+    assert dense["status"] == "complete" and dense["points"] == 700 and dense["progress"] == 100
+    assert dense["sameFrame"] is True and dense["frameOffset"] == 0.0
+    assert set(dense["seconds"]) == {"undistorting", "stereo", "fusing"}
+    assert dense["workspaceBytes"] >= 4096 and dense["maxImageSize"] == 640
+    assert session.dense_ply_path.is_file() and dense["bytes"] == session.dense_ply_path.stat().st_size
+    # Depth maps, the undistorted copy and the .vis file are gone; the log stays.
+    assert not session.dense_dir.exists()
+    assert not Path(f"{session.dense_ply_path}.vis").exists()
+    assert "Dense cloud: 700 points" in session.read_log()
+
+
+def test_a_dense_cloud_in_another_frame_is_kept_but_not_trusted(tmp_path, find_scene):
+    from backend.report import dense_for_views
+
+    folder, _ = find_scene
+    session = dense_scan(tmp_path, folder)
+    run_async(ReconstructionPipeline(session, runner=DenseRunner(folder, move_cameras=True)).run())
+    assert session.dense["status"] == "complete" and session.dense["sameFrame"] is False
+    assert session.dense["frameOffset"] > config.DENSE_FRAME_TOLERANCE
+    assert not dense_for_views(session)
+    assert "not used for measuring" in session.read_log()
+
+
+def test_dense_progress_counts_both_patch_match_passes(tmp_path):
+    pipeline = dense_pipeline(tmp_path)
+    pipeline.session.set_dense(status="stereo", progress=10)
+    for view in (1, 2, 3, 4):
+        pipeline._patch_match_progress(f"Processing view {view} / 4 for frame_{view:06d}.jpg")
+    assert pipeline.session.dense["detail"] == "depth maps, pass 1 of 2: view 4 of 4"
+    assert pipeline.session.dense["progress"] == 50
+    pipeline._patch_match_progress("Processing view 1 / 4 for frame_000001.jpg")
+    assert pipeline.session.dense["detail"] == "depth maps, pass 2 of 2: view 1 of 4"
+    pipeline._fusion_progress("Fusing image [4/4] with index 3")
+    assert pipeline.session.dense["progress"] == 99
+
+
+@pytest.mark.parametrize(
+    ("runner_kwargs", "reason"),
+    [
+        ({"gpu_build": False}, "CPU-only build"),
+        ({"gpu": "unknown"}, "no NVIDIA GPU"),
+    ],
+    ids=["cpu-only-build", "no-nvidia-gpu"],
+)
+def test_no_dense_without_a_cuda_build_and_an_nvidia_gpu(tmp_path, find_scene, runner_kwargs, reason):
+    """COLMAP would stop with "Dense stereo reconstruction requires CUDA": never try."""
+    folder, _ = find_scene
+    session = dense_scan(tmp_path, folder)
+    runner = DenseRunner(folder, **runner_kwargs)
+    run_async(ReconstructionPipeline(session, runner=runner).run())
+    assert not {"image_undistorter", "patch_match_stereo", "stereo_fusion"} & {c for c, _ in runner.calls}
+    assert session.dense["status"] == "unavailable" and reason in session.dense["reason"]
+    assert_intact_sparse_scan(session)
+
+
+def test_no_dense_after_a_gpu_failure(tmp_path, find_scene):
+    folder, _ = find_scene
+    session = dense_scan(tmp_path, folder)
+    runner = DenseRunner(folder)
+    runner.gpu_failed = True
+    run_async(ReconstructionPipeline(session, runner=runner).run())
+    assert "patch_match_stereo" not in {c for c, _ in runner.calls}
+    assert session.dense["status"] == "unavailable" and "Re-detect" in session.dense["reason"]
+
+
+def test_dense_is_offered_exactly_when_the_gpu_is_used(tmp_path):
+    from backend.reconstruction import dense_support
+
+    for kwargs in ({}, {"gpu": "NVIDIA RTX 4070"}, {"gpu": "NVIDIA RTX 4070", "gpu_build": False}):
+        for failed in (False, True):
+            runner = FakeRunner(**kwargs)
+            runner.gpu_failed = failed
+            pipeline = ReconstructionPipeline(ScanManager(tmp_path / "s").create(), runner=runner)
+            assert dense_support(runner)[0] == (pipeline.use_gpu == "1")
+
+
+def test_no_dense_stage_unless_asked(tmp_path, find_scene):
+    folder, _ = find_scene
+    session = dense_scan(tmp_path, folder, dense=False)
+    runner = DenseRunner(folder)
+    run_async(ReconstructionPipeline(session, runner=runner).run())
+    assert "image_undistorter" not in {c for c, _ in runner.calls}
+    assert session.dense is None and session.status is ScanStatus.COMPLETE
+
+
+@pytest.mark.parametrize(
+    ("command", "error", "reason"),
+    [
+        ("patch_match_stereo", ColmapCommandError("patch_match_stereo", 1, "Error: CUDA error: out of memory"),
+         "the GPU ran out of memory while computing depth maps; a faster preset uses smaller images"),
+        ("patch_match_stereo", ColmapCommandError("patch_match_stereo", -1, "Processing view 3 / 60\n[timed out]"),
+         "computing depth maps took longer than 60 minutes"),
+        ("stereo_fusion", ColmapCommandError("stereo_fusion", 0xC0000005, "Fusing image [2/60]"),
+         "COLMAP stopped unexpectedly while fusing the depth maps (exit code 0xC0000005)"),
+        ("image_undistorter", ColmapCommandError("image_undistorter", 1, "Cannot read image"),
+         "COLMAP exited with code 1 while undistorting the images"),
+    ],
+    ids=["gpu-out-of-memory", "timeout", "crash", "error"],
+)
+def test_a_dense_failure_never_fails_the_scan(tmp_path, find_scene, command, error, reason):
+    folder, _ = find_scene
+    session = dense_scan(tmp_path, folder)
+    runner = DenseRunner(folder, fail={command: error})
+    run_async(ReconstructionPipeline(session, runner=runner).run())
+    assert session.dense["status"] == "failed" and session.dense["reason"] == reason
+    assert_intact_sparse_scan(session)
+    assert "[dense error]" in session.read_log()
+    # A CUDA error in patch-match keeps the server on the CPU, like a SIFT GPU failure.
+    assert runner.gpu_failed is (command == "patch_match_stereo" and "CUDA" in error.tail)
+
+
+def test_fusion_without_points_is_a_failed_dense_cloud(tmp_path, find_scene):
+    folder, _ = find_scene
+    session = dense_scan(tmp_path, folder)
+    run_async(ReconstructionPipeline(session, runner=DenseRunner(folder, fused_points=0)).run())
+    assert session.dense == {**session.dense, "status": "failed", "reason": "stereo fusion produced no points"}
+    assert_intact_sparse_scan(session)
+
+
+def test_cancelling_the_dense_stage_keeps_the_scan(tmp_path, find_scene):
+    import asyncio
+
+    folder, _ = find_scene
+    session = dense_scan(tmp_path, folder)
+    runner = DenseRunner(folder, hang=True)
+
+    async def scenario():
+        runner.started = asyncio.Event()
+        task = asyncio.create_task(ReconstructionPipeline(session, runner=runner).run())
+        await asyncio.wait_for(runner.started.wait(), timeout=30)
+        assert session.status is ScanStatus.COMPLETE and session.dense["status"] == "stereo"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run_async(scenario())
+    assert session.dense["status"] == "cancelled"
+    assert_intact_sparse_scan(session)
+
+
+def test_a_dense_run_interrupted_by_a_restart_reloads_as_cancelled(tmp_path):
+    session = ScanManager(tmp_path / "scans").create(dense=True)
+    session.set_status(ScanStatus.COMPLETE)
+    session.set_dense(status="stereo", progress=40)
+    fresh = ScanManager(tmp_path / "scans").get(session.id)
+    assert fresh.status is ScanStatus.COMPLETE and fresh.dense_requested
+    assert fresh.dense["status"] == "cancelled" and "server stopped" in fresh.dense["reason"]
+
+
+def test_the_report_draws_the_trusted_dense_cloud(tmp_path, find_scene):
+    from backend.report import build_report, capture_log, dense_for_views
+
+    folder, _ = find_scene
+    session = completed_find_scan(ScanManager(tmp_path / "scans"), folder)
+    assert capture_log(session)["dense"] is None
+    sparse_pdf = build_report(session, "1.1.0")
+
+    from backend.reconstruction import read_points3d
+
+    xyz, _ = read_points3d(session.sparse_dir / "0")
+    write_dense_ply(session.dense_ply_path, np.repeat(xyz, 3, axis=0))
+    session.set_dense(status="complete", points=3 * len(xyz), sameFrame=True, frameOffset=0.0,
+                      maxImageSize=640, totalSeconds=12.0)
+    assert dense_for_views(session)
+    log = capture_log(session)
+    assert log["densePoints"] == 3 * len(xyz) and log["dense"].startswith(f"{3 * len(xyz):,} points")
+    assert build_report(session, "1.1.0") != sparse_pdf
+
+    session.set_dense(sameFrame=False)
+    assert not dense_for_views(session) and capture_log(session)["densePoints"] is None
+    assert "not used for the views" in capture_log(session)["dense"]
+    session.set_dense(status="failed", reason="the GPU reported an error while computing depth maps")
+    assert capture_log(session)["dense"] == "failed: the GPU reported an error while computing depth maps"
+
+
+def test_system_endpoint_says_why_there_is_no_dense_cloud(client, monkeypatch):
+    monkeypatch.setattr(application, "colmap", FakeRunner(gpu="NVIDIA RTX 4070", gpu_build=False))
+    dense = client.get("/api/system").json()["dense"]
+    assert dense["available"] is False and dense["short"] == "CPU-only COLMAP build"
+    assert "get_colmap.py --cuda" in dense["reason"]
+
+    monkeypatch.setattr(application, "colmap", FakeRunner(gpu="NVIDIA RTX 4070"))
+    payload = client.get("/api/system").json()
+    assert payload["dense"] == {"available": True, "short": "NVIDIA RTX 4070", "reason": "NVIDIA GPU: NVIDIA RTX 4070"}
+    assert [p["denseMaxImageSize"] for p in payload["presets"]] == [640, 1024, 1600]
+
+
+def test_dense_endpoints(client, find_scene, monkeypatch):
+    folder, _ = find_scene
+    session = completed_find_scan(client.manager, folder)
+    url = f"/api/scans/{session.id}"
+
+    monkeypatch.setattr(application, "colmap", FakeRunner(gpu="unknown"))
+    refused = client.post(f"{url}/dense")
+    assert refused.status_code == 409 and "no NVIDIA GPU" in refused.json()["detail"]
+    assert client.get(f"{url}/result").json()["densePlyUrl"] is None
+    assert client.get(f"{url}/dense.ply").status_code == 404
+
+    runner = DenseRunner(folder)
+    monkeypatch.setattr(application, "colmap", runner)
+    monkeypatch.setattr(application, "ReconstructionPipeline",
+                        lambda s: ReconstructionPipeline(s, runner=runner))
+    started = client.post(f"{url}/dense")
+    assert started.status_code == 200 and started.json()["status"] == "complete"
+    for _ in range(100):  # the job runs on the TestClient's event loop
+        status = client.get(f"{url}/status").json()
+        if status["dense"]["status"] == "complete":
+            break
+        import time
+
+        time.sleep(0.05)
+    assert status["status"] == "complete" and status["dense"]["status"] == "complete"
+    result = client.get(f"{url}/result").json()
+    assert result["densePlyUrl"] == f"{url}/dense.ply"
+    ply = client.get(f"{url}/dense.ply")
+    assert ply.status_code == 200 and f"{session.id}-dense.ply" in ply.headers["content-disposition"]
+
+    capturing = client.post("/api/scans", json={"dense": True}).json()
+    assert capturing["denseRequested"] is True
+    assert client.post(f"/api/scans/{capturing['id']}/dense").status_code == 409
