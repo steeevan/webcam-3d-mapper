@@ -131,6 +131,16 @@
           <span class="field-label">Scan quality</span>
           <div class="segmented" id="preset-toggle" role="radiogroup" aria-label="Scan quality"></div>
         </div>
+        <div class="field field-compact dense-field" id="dense-field">
+          <span class="field-label">Dense cloud</span>
+          <div class="dense-row">
+            <label class="check-field dense-choice">
+              <input type="checkbox" id="dense-toggle" disabled />
+              <span>NVIDIA GPU</span>
+            </label>
+            <span class="field-note" id="dense-why"></span>
+          </div>
+        </div>
         <div class="field field-compact">
           <span class="field-label">Find</span>
           <button class="btn btn-ghost record-pending" id="btn-record-pending" type="button" title="Find number, site, context and material for the next scan">
@@ -218,6 +228,10 @@
           <input type="checkbox" id="auto-rotate" checked />
           <span>Spin</span>
         </label>
+        <div class="segmented segmented-sm" id="cloud-toggle" role="radiogroup" aria-label="Point cloud" hidden>
+          <button type="button" role="radio" data-cloud="sparse" aria-checked="true" title="COLMAP's sparse points (structure from motion)">Sparse</button>
+          <button type="button" role="radio" data-cloud="dense" aria-checked="false" title="Dense points from patch-match stereo (NVIDIA GPU)">Dense</button>
+        </div>
         <button class="btn btn-ghost btn-sm" id="btn-measure" aria-pressed="false" hidden title="Click two points of the cloud to measure the distance between them">Measure</button>
       </div>
     </div>
@@ -227,6 +241,13 @@
       <div class="result-warning" id="result-warning" hidden></div>
       <div class="scale-badge" id="scale-badge" hidden></div>
       <div class="measure-readout" id="measure-readout" hidden></div>
+      <div class="dense-strip" id="dense-strip" hidden data-state="">
+        <div class="dense-head">
+          <b>Dense cloud</b><span id="dense-text"></span>
+        </div>
+        <div class="dense-bar" id="dense-bar" hidden><i id="dense-fill"></i></div>
+        <button class="btn btn-ghost btn-xs" id="btn-dense-action" type="button" hidden></button>
+      </div>
       <div class="scale-bar" id="scale-bar" hidden title="Length at the orbit centre; nearer points look bigger">
         <i id="scale-bar-line"></i><span id="scale-bar-label"></span>
       </div>
@@ -247,7 +268,8 @@
         <button class="btn btn-ghost" id="btn-record">Find record</button>
         <button class="btn btn-ghost" id="btn-report" title="Two-page PDF: views, photo, record, capture log">Find report</button>
         <button class="btn btn-ghost" id="btn-reset-view">Reset view</button>
-        <button class="btn btn-ghost" id="btn-export">Export .PLY</button>
+        <button class="btn btn-ghost" id="btn-export" title="The sparse point cloud">Export .PLY</button>
+        <button class="btn btn-ghost" id="btn-export-dense" title="The dense point cloud" hidden>Export dense .PLY</button>
         <button class="btn btn-ghost" id="btn-open-folder">Scan folder</button>
         <button class="btn btn-primary" id="btn-new-scan">New scan</button>
       </div>
@@ -356,6 +378,7 @@
           <button class="btn btn-ghost btn-sm" id="btn-detect-colmap">Re-detect</button>
         </div>
         <p class="setting-note" id="engine-note"></p>
+        <p class="setting-note" id="dense-note"></p>
         <details class="tech">
           <summary>Searched locations</summary>
           <pre id="engine-searched" class="tech-log"></pre>
@@ -402,8 +425,9 @@
         <h4>About</h4>
         <p class="setting-note">
           Structure-from-motion from a single webcam. There is no depth sensor involved, so the
-          result is a sparse point cloud with real-world scale only when the printed marker board
-          was in view. Everything runs locally — nothing is uploaded.
+          result is a sparse point cloud (plus an optional dense one on an NVIDIA GPU) with
+          real-world scale only when the printed marker board was in view. Everything runs
+          locally — nothing is uploaded.
         </p>
         <p class="setting-note" id="about-versions"></p>
       </section>

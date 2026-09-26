@@ -1,14 +1,19 @@
-"""The sparse reconstruction pipeline.
+"""The reconstruction pipeline: sparse, then optionally dense.
 
     feature_extractor -> sequential_matcher -> mapper -> model_converter (PLY)
+    [NVIDIA GPU, opt-in] image_undistorter -> patch_match_stereo -> stereo_fusion (dense PLY)
 
-All four run as async subprocesses so the FastAPI event loop stays responsive. Progress is
+All of them run as async subprocesses so the FastAPI event loop stays responsive. Progress is
 stage-based; inside a stage we refine it from COLMAP's own counters ("Processed file [12/94]",
 "Registering image #31 (24)") rather than inventing a percentage.
 
 The module also contains a small reader for COLMAP's binary model format. Reading it directly
 avoids an extra subprocess and gives us the camera trajectory for the viewer; the layout has
 been stable across COLMAP releases.
+
+The dense stage starts only after the scan is marked complete, and nothing it does can change
+that: a failed, timed-out or cancelled dense run leaves the sparse cloud, the scale and the
+report exactly as they were, plus a note saying why there is no dense cloud.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import json
 import logging
 import math
 import re
+import shutil
 import struct
 import time
 from pathlib import Path
@@ -36,6 +42,11 @@ logger = logging.getLogger(__name__)
 _PROCESSED_RE = re.compile(r"Processed file \[(\d+)/(\d+)\]")
 _MATCH_BLOCK_RE = re.compile(r"Matching block \[(\d+)/(\d+)")
 _REGISTERING_RE = re.compile(r"Registering image #(\d+) \((\d+)\)")
+# Dense progress lines, as printed by COLMAP 4.2 (src/colmap/controllers/undistorters.cc,
+# mvs/patch_match.cc, mvs/fusion.cc; the same format strings are in the 4.2.0 CUDA binary).
+_UNDISTORT_RE = re.compile(r"Undistorting image \[(\d+)/(\d+)\]")
+_PATCH_MATCH_RE = re.compile(r"Processing view (\d+) / (\d+)")
+_FUSING_RE = re.compile(r"Fusing image \[(\d+)/(\d+)\]")
 
 
 # --------------------------------------------------------------------------------------
@@ -284,6 +295,119 @@ def read_points3d(model_dir: Path) -> tuple[np.ndarray, np.ndarray]:
     )
 
 
+#: PLY property types -> little-endian numpy types.
+_PLY_TYPES = {
+    "char": "i1", "int8": "i1", "uchar": "u1", "uint8": "u1",
+    "short": "<i2", "int16": "<i2", "ushort": "<u2", "uint16": "<u2",
+    "int": "<i4", "int32": "<i4", "uint": "<u4", "uint32": "<u4",
+    "float": "<f4", "float32": "<f4", "double": "<f8", "float64": "<f8",
+}
+
+
+def _ply_header(path: Path) -> tuple[int, np.dtype, int]:
+    """``(vertex count, vertex record dtype, header length in bytes)`` of a binary PLY.
+
+    Only what COLMAP writes is supported: binary little-endian with the vertex element first
+    (``stereo_fusion`` adds normals to x, y, z and the colour). Lines may end in CRLF.
+    """
+    with path.open("rb") as handle:
+        head = handle.read(4096)
+    end = head.find(b"end_header")
+    if not head.startswith(b"ply") or end < 0:
+        raise ValueError(f"{path.name} is not a PLY file")
+    header_len = head.index(b"\n", end) + 1
+    lines = [line.strip().decode("ascii", "replace") for line in head[:header_len].splitlines()]
+    if "format binary_little_endian 1.0" not in lines:
+        raise ValueError(f"{path.name} is not a binary little-endian PLY")
+    count, fields, in_vertex = 0, [], False
+    for line in lines:
+        parts = line.split()
+        if parts[:1] == ["element"]:
+            if in_vertex or fields:
+                break  # vertex properties are complete; later elements are not read
+            in_vertex = parts[1] == "vertex"
+            if not in_vertex:
+                raise ValueError(f"{path.name}: the vertex element must come first")
+            count = int(parts[2])
+        elif parts[:1] == ["property"] and in_vertex:
+            if parts[1] == "list" or parts[1] not in _PLY_TYPES:
+                raise ValueError(f"{path.name}: unsupported vertex property {line!r}")
+            fields.append((parts[2], _PLY_TYPES[parts[1]]))
+    if not {"x", "y", "z"} <= {name for name, _ in fields}:
+        raise ValueError(f"{path.name} has no x, y, z vertex properties")
+    return count, np.dtype(fields), header_len
+
+
+def ply_vertex_count(path: Path) -> int:
+    """Number of points in a PLY file, from its header."""
+    return _ply_header(path)[0]
+
+
+def read_ply_points(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Positions ``(N, 3)`` float64 and colours ``(N, 3)`` uint8 from a binary PLY (map.ply or
+    dense.ply). Points without colour properties come back grey."""
+    count, dtype, header_len = _ply_header(path)
+    records = np.fromfile(path, dtype=dtype, count=count, offset=header_len)
+    xyz = np.stack([records["x"], records["y"], records["z"]], axis=1).astype(np.float64)
+    if {"red", "green", "blue"} <= set(dtype.names):
+        rgb = np.stack([records["red"], records["green"], records["blue"]], axis=1).astype(np.uint8)
+    else:
+        rgb = np.full((len(xyz), 3), 160, np.uint8)
+    return xyz, rgb
+
+
+def frame_offset(sparse_model: Path, dense_model: Path) -> float | None:
+    """How far the dense workspace's cameras are from the sparse model's, in one number.
+
+    ``image_undistorter`` copies the poses into ``dense/sparse`` and ``stereo_fusion``
+    back-projects every depth pixel with those poses, so the dense cloud is in the sparse
+    model's frame exactly when these cameras are. Returns the largest camera-centre
+    difference as a fraction of the cameras' spread (0 for identical poses), or None when
+    the two models do not hold the same images.
+    """
+    sparse = {camera["name"]: camera["position"] for camera in read_camera_centers(sparse_model)}
+    dense = {camera["name"]: camera["position"] for camera in read_camera_centers(dense_model)}
+    names = sorted(sparse)
+    if len(names) < 2 or set(names) != set(dense):
+        return None
+    a = np.array([sparse[name] for name in names])
+    b = np.array([dense[name] for name in names])
+    spread = float(np.linalg.norm(a - a.mean(axis=0), axis=1).max())
+    if spread <= 0:
+        return None
+    return float(np.linalg.norm(a - b, axis=1).max()) / spread
+
+
+def dense_support(runner: ColmapRunner) -> tuple[bool, str, str]:
+    """Can this machine make a dense cloud now? ``(yes/no, short label, the reason in words)``.
+
+    The same conditions as ``ReconstructionPipeline.use_gpu == "1"``: a CUDA build of COLMAP,
+    an NVIDIA GPU that nvidia-smi reports, and no GPU failure earlier in this server's life.
+    A CPU-only build would stop with "Dense stereo reconstruction requires CUDA", so dense is
+    never attempted there.
+    """
+    info = runner.detect()
+    if not info.available:
+        return False, "COLMAP not found", "COLMAP is not installed or cannot start"
+    if not info.gpu_build:
+        return False, "CPU-only COLMAP build", (
+            "this COLMAP is the CPU-only build; dense stereo needs the CUDA build "
+            "(python scripts/get_colmap.py --cuda --force)"
+        )
+    if info.gpu in ("unknown", "CPU-only build"):
+        return False, "no NVIDIA GPU found", "no NVIDIA GPU was found (nvidia-smi did not report one)"
+    if runner.gpu_failed:
+        return False, "GPU failed earlier", (
+            "a GPU stage failed earlier, so this server stays on the CPU until you press "
+            "Re-detect in Settings"
+        )
+    return True, info.gpu, f"NVIDIA GPU: {info.gpu}"
+
+
+class DenseError(RuntimeError):
+    """The dense stage finished without a usable cloud (the message says why)."""
+
+
 def read_model(model_dir: Path) -> tuple[Path | None, int, int]:
     """A mapper output directory: either one model in place or numbered components under it.
 
@@ -325,6 +449,8 @@ class ReconstructionPipeline:
         self.session = session
         self.runner = runner or default_runner
         self.preset = config.PRESETS.get(session.preset, config.PRESETS[config.DEFAULT_PRESET])
+        #: "Processing view" lines seen in the running patch_match_stereo (two per image).
+        self._views_done = 0
 
     # -- argument construction -------------------------------------------------
 
@@ -407,6 +533,54 @@ class ReconstructionPipeline:
             ],
         )
 
+    # Dense stage. The undistorter already shrinks the images to the preset's size; the same
+    # limit is passed to the two later stages too, so it holds even on a build whose
+    # undistorter lacks the option (they then downsize while reading).
+
+    def image_undistorter_args(self, model_dir: Path) -> list[str]:
+        return self.runner.filter_options(
+            "image_undistorter",
+            [
+                ("image_path", self.session.images_dir),
+                ("input_path", model_dir),
+                ("output_path", self.session.dense_dir),
+                ("output_type", "COLMAP"),
+                ("max_image_size", self.preset.dense_max_image_size),
+                ("num_patch_match_src_images", config.DENSE_SOURCE_IMAGES),
+            ],
+        )
+
+    def patch_match_stereo_args(self) -> list[str]:
+        return self.runner.filter_options(
+            "patch_match_stereo",
+            [
+                ("workspace_path", self.session.dense_dir),
+                ("workspace_format", "COLMAP"),
+                # Photometric depth maps first, then a pass that makes neighbouring views
+                # agree; stereo_fusion reads the filtered "geometric" maps.
+                ("PatchMatchStereo.geom_consistency", 1),
+                ("PatchMatchStereo.max_image_size", self.preset.dense_max_image_size),
+            ],
+        )
+
+    def stereo_fusion_args(self) -> list[str]:
+        return self.runner.filter_options(
+            "stereo_fusion",
+            [
+                ("workspace_path", self.session.dense_dir),
+                ("workspace_format", "COLMAP"),
+                ("input_type", "geometric"),
+                ("output_type", "PLY"),
+                ("output_path", self.fused_path),
+                ("StereoFusion.max_image_size", self.preset.dense_max_image_size),
+            ],
+        )
+
+    @property
+    def fused_path(self) -> Path:
+        """Fusion writes here (plus a ``.vis`` file next to it); only the PLY is kept."""
+        return self.session.dense_dir / "fused.ply"
+
     # -- progress ---------------------------------------------------------------
 
     def _extraction_progress(self, line: str) -> None:
@@ -429,6 +603,41 @@ class ReconstructionPipeline:
             self.session.set_progress(
                 80 + int(14 * registered / total), f"{registered} images placed"
             )
+
+    # Dense progress is its own 0-100 inside ``session.dense``: the scan is already complete.
+    # Undistortion is quick (0-10), patch-match is the bulk (10-90), fusion the rest.
+
+    def _dense_progress(self, progress: float, detail: str) -> None:
+        current = (self.session.dense or {}).get("progress", 0)
+        self.session.set_dense(save=False, progress=max(current, min(int(progress), 99)), detail=detail)
+
+    def _undistort_progress(self, line: str) -> None:
+        match = _UNDISTORT_RE.search(line)
+        if match:
+            done, total = int(match.group(1)), max(int(match.group(2)), 1)
+            self._dense_progress(10 * done / total, f"image {done} of {total}")
+
+    def _patch_match_progress(self, line: str) -> None:
+        """With geometric consistency COLMAP makes two passes over every view (photometric for
+        all, then geometric), each printing "Processing view i / N"; count the lines."""
+        match = _PATCH_MATCH_RE.search(line)
+        if match:
+            total = max(int(match.group(2)), 1)
+            self._views_done += 1
+            passes = 2
+            done = min(self._views_done, passes * total)
+            current_pass = min((done - 1) // total + 1, passes)
+            view = done - (current_pass - 1) * total
+            self._dense_progress(
+                10 + 80 * done / (passes * total),
+                f"depth maps, pass {current_pass} of {passes}: view {view} of {total}",
+            )
+
+    def _fusion_progress(self, line: str) -> None:
+        match = _FUSING_RE.search(line)
+        if match:
+            done, total = int(match.group(1)), max(int(match.group(2)), 1)
+            self._dense_progress(90 + 9 * done / total, f"image {done} of {total}")
 
     # -- execution ---------------------------------------------------------------
 
@@ -560,6 +769,111 @@ class ReconstructionPipeline:
                 )
             )
 
+        # Only now, with the sparse scan saved as complete, and outside the handlers above:
+        # nothing that happens in the dense stage can turn this into a failed scan.
+        if self.session.status == ScanStatus.COMPLETE and self.session.dense_requested:
+            await self.run_dense()
+
+    async def run_dense(self) -> None:
+        """image_undistorter -> patch_match_stereo -> stereo_fusion -> ``result/dense.ply``.
+
+        Only ever called on a complete scan. It writes ``session.dense`` and nothing else of
+        the session: failure, timeout and cancellation end as a ``failed``/``cancelled`` note
+        with a reason, never as a failed scan. The workspace (undistorted images, depth and
+        normal maps) is removed afterwards in every case; ``dense.ply`` and the log stay.
+        """
+        session = self.session
+        log = session.append_log
+        available, _, reason = dense_support(self.runner)
+        if not available or self.use_gpu != "1":
+            session.dense = None
+            session.set_dense(status="unavailable", reason=reason)
+            log(f"\nDense cloud not made: {reason}\n")
+            return
+
+        index = session.result.model_index if session.result else None
+        model_dir = session.sparse_dir / str(index) if index is not None else None
+        if model_dir is None or not (model_dir / "images.bin").is_file():
+            session.dense = None
+            session.set_dense(status="failed", reason="the sparse model is missing")
+            return
+
+        size = self.preset.dense_max_image_size
+        session.dense = None
+        session.set_dense(status="queued", progress=0, detail="", maxImageSize=size)
+        log(f"\n=== Dense cloud ({self.preset.name}, images at most {size} px) ===\n")
+        self._views_done = 0
+        started = time.time()
+        seconds: dict[str, float] = {}
+        stages: list[tuple[str, str, Callable[[], list[str]], Callable[[str], None], int]] = [
+            ("undistorting", "image_undistorter",
+             lambda: self.image_undistorter_args(model_dir), self._undistort_progress, 0),
+            ("stereo", "patch_match_stereo",
+             self.patch_match_stereo_args, self._patch_match_progress, 10),
+            ("fusing", "stereo_fusion", self.stereo_fusion_args, self._fusion_progress, 90),
+        ]
+        try:
+            # A re-run replaces an older cloud; a half-written workspace is never reused.
+            session.dense_ply_path.unlink(missing_ok=True)
+            await asyncio.to_thread(_remove_tree, session.dense_dir)
+            for state, command, build_args, progress, floor in stages:
+                session.set_dense(status=state, progress=floor, detail="")
+                stage_started = time.time()
+                await self.runner.run(
+                    command, build_args(), log_sink=log, line_callback=progress,
+                    timeout=config.DENSE_STAGE_TIMEOUT_S,
+                )
+                seconds[state] = round(time.time() - stage_started, 1)
+
+            points = ply_vertex_count(self.fused_path) if self.fused_path.is_file() else 0
+            if points == 0:
+                raise DenseError("stereo fusion produced no points")
+            workspace_bytes = await asyncio.to_thread(_tree_size, session.dense_dir)
+            offset = await asyncio.to_thread(frame_offset, model_dir, session.dense_dir / "sparse")
+            same_frame = offset is not None and offset <= config.DENSE_FRAME_TOLERANCE
+            session.result_dir.mkdir(parents=True, exist_ok=True)
+            self.fused_path.replace(session.dense_ply_path)
+            session.set_dense(
+                status="complete",
+                progress=100,
+                detail="",
+                points=points,
+                bytes=session.dense_ply_path.stat().st_size,
+                workspaceBytes=workspace_bytes,
+                seconds=seconds,
+                totalSeconds=round(time.time() - started, 1),
+                frameOffset=offset,
+                sameFrame=same_frame,
+            )
+            log(
+                f"\nDense cloud: {points} points in {session.dense['totalSeconds']}s "
+                f"(stages {seconds}); workspace {workspace_bytes / 1e6:.0f} MB before clean-up; "
+                "camera offset from the sparse model "
+                + (f"{offset:.2e} of the camera spread" if offset is not None else "not comparable")
+                + ("" if same_frame else " - not used for measuring")
+                + "\n"
+            )
+        except ColmapCommandError as exc:
+            log(f"\n[dense error] {exc}\n{exc.tail}\n")
+            timed_out = "[timed out]" in exc.tail
+            if exc.command == "patch_match_stereo" and _is_gpu_failure(exc) and not timed_out:
+                # As for SIFT: after a GPU failure the server stays on the CPU until Re-detect.
+                self.runner.gpu_failed = True
+            session.set_dense(status="failed", reason=_dense_failure_reason(exc), seconds=seconds)
+        except DenseError as exc:
+            log(f"\n[dense error] {exc}\n")
+            session.set_dense(status="failed", reason=str(exc), seconds=seconds)
+        except asyncio.CancelledError:
+            log("\nDense cloud cancelled.\n")
+            session.set_dense(status="cancelled", reason="cancelled", seconds=seconds)
+            raise
+        except Exception as exc:  # pragma: no cover - unexpected failure path
+            logger.exception("Dense stage failed for %s", session.id)
+            log(f"\n[dense error] {exc!r}\n")
+            session.set_dense(status="failed", reason=f"internal error: {exc}", seconds=seconds)
+        finally:
+            # Depth and normal maps are several times the size of the scan itself.
+            _remove_tree(session.dense_dir)
 
     async def _run_sift_stage(
         self, command: str, build_args: Callable[[], list[str]], progress: Callable[[str], None]
@@ -630,6 +944,39 @@ def _crashed(returncode: int) -> bool:
 def _is_gpu_failure(exc: ColmapCommandError) -> bool:
     tail = exc.tail.lower()
     return any(token in tail for token in ("cuda", "no gpu", "opengl", "siftgpu", "sift_gpu"))
+
+
+_DENSE_STAGE_WORDS = {
+    "image_undistorter": "undistorting the images",
+    "patch_match_stereo": "computing depth maps",
+    "stereo_fusion": "fusing the depth maps",
+}
+
+
+def _dense_failure_reason(exc: ColmapCommandError) -> str:
+    """One line for "Dense cloud failed: <reason>"; the raw output is in the log."""
+    doing = _DENSE_STAGE_WORDS.get(exc.command, exc.command)
+    tail = exc.tail.lower()
+    if "[timed out]" in tail:
+        return f"{doing} took longer than {config.DENSE_STAGE_TIMEOUT_S / 60:.0f} minutes"
+    if "out of memory" in tail:
+        return f"the GPU ran out of memory while {doing}; a faster preset uses smaller images"
+    if _is_gpu_failure(exc):
+        return f"the GPU reported an error while {doing}"
+    if _crashed(exc.returncode):
+        return f"COLMAP stopped unexpectedly while {doing} (exit code 0x{exc.returncode & 0xFFFFFFFF:08X})"
+    return f"COLMAP exited with code {exc.returncode} while {doing}"
+
+
+def _tree_size(path: Path) -> int:
+    """Bytes in all files under ``path`` (0 if it does not exist)."""
+    if not path.is_dir():
+        return 0
+    return sum(entry.stat().st_size for entry in path.rglob("*") if entry.is_file())
+
+
+def _remove_tree(path: Path) -> None:
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _translate_command_error(exc: ColmapCommandError) -> ScanError:

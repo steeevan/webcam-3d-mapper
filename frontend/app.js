@@ -56,6 +56,9 @@ const el = {
 
   cameraSelect: $('camera-select'),
   presetToggle: $('preset-toggle'),
+  denseToggle: $('dense-toggle'),
+  denseWhy: $('dense-why'),
+  denseField: $('dense-field'),
   btnRecordPending: $('btn-record-pending'),
   pendingRecordLabel: $('pending-record-label'),
   btnStart: $('btn-start'),
@@ -101,6 +104,13 @@ const el = {
   btnReport: $('btn-report'),
   btnResetView: $('btn-reset-view'),
   btnExport: $('btn-export'),
+  btnExportDense: $('btn-export-dense'),
+  cloudToggle: $('cloud-toggle'),
+  denseStrip: $('dense-strip'),
+  denseText: $('dense-text'),
+  denseBar: $('dense-bar'),
+  denseFill: $('dense-fill'),
+  btnDenseAction: $('btn-dense-action'),
   btnOpenFolder: $('btn-open-folder'),
   btnNewScan: $('btn-new-scan'),
 
@@ -134,6 +144,7 @@ const el = {
   btnCloseSettings: $('btn-close-settings'),
   engineStatus: $('engine-status'),
   engineNote: $('engine-note'),
+  denseNote: $('dense-note'),
   engineSearched: $('engine-searched'),
   colmapPath: $('colmap-path'),
   btnSaveColmap: $('btn-save-colmap'),
@@ -180,7 +191,11 @@ const state = {
   query: '', // library search
   pendingRecord: null, // find record for the next scan, typed before pressing Start
   result: null, // the scan shown in the result view (its status payload)
+  dense: false, // the person wants a dense cloud with the next scan (NVIDIA GPU only)
 };
+
+/** The result view's clouds: which one is shown, their URLs, and the dense-stage poll. */
+const clouds = { shown: 'sparse', sparseUrl: null, denseUrl: null, cameras: [], pollTimer: null };
 
 /** Which record the form edits: `{ kind: 'pending' }` or `{ kind: 'scan', id }`. */
 const recordForm = { target: null };
@@ -302,6 +317,7 @@ async function loadSystem() {
   if (!state.system.presets.some((preset) => preset.name === state.preset)) {
     state.preset = state.system.defaultPreset;
   }
+  state.dense = storageGet('dense') === 'true';
   renderPresets();
   renderEngine();
   setupRecordForm(state.system.record);
@@ -332,6 +348,7 @@ function renderPresets() {
 function renderEngine() {
   const info = state.system.colmap;
   el.pillEngine.dataset.ok = info.available ? 'true' : 'error';
+  renderDenseChoice();
 
   if (info.available) {
     el.engineStatus.innerHTML = `<span class="ok">Detected</span> · version ${info.version} · GPU: ${info.gpu}`;
@@ -349,6 +366,24 @@ function renderEngine() {
     el.engineSearched.textContent = (info.searched || []).join('\n');
   }
 }
+
+/** Dense stereo needs a CUDA build of COLMAP and an NVIDIA GPU; say which is missing. */
+function renderDenseChoice() {
+  const dense = state.system.dense || { available: false, short: 'unknown', reason: '' };
+  el.denseToggle.disabled = !dense.available;
+  el.denseToggle.checked = dense.available && state.dense;
+  el.denseWhy.textContent = dense.available ? '' : `Not available: ${dense.short}`;
+  el.denseField.title = dense.available
+    ? `After the sparse cloud, compute a dense one on the GPU (${dense.short}). ` +
+      'It takes longer; the scan is complete and usable before it starts.'
+    : `Dense cloud not available: ${dense.reason}.`;
+  el.denseNote.textContent = dense.available
+    ? `Dense cloud: available (${dense.reason}).`
+    : `Dense cloud: not available — ${dense.reason}.`;
+}
+
+/** Ask for a dense cloud with this scan? Only when the person chose it and it can run. */
+const denseWanted = () => Boolean(state.system?.dense?.available && state.dense);
 
 function openSettings() {
   el.settingsModal.hidden = false;
@@ -925,6 +960,7 @@ async function startScan() {
       record: state.pendingRecord,
       camera: track?.label || '',
       markerSizeMm: markerSizeSetting(),
+      dense: denseWanted(),
     });
     // The record now belongs to this scan; the next find gets a fresh one.
     state.pendingRecord = null;
@@ -1004,7 +1040,8 @@ async function finishScan() {
   const seconds = (Date.now() - state.scanStartedAt) / 1000;
   el.processingSub.textContent =
     `${state.acceptedFrames} frames · ${clock(seconds)} of scanning · ` +
-    `${presetLabel(state.preset)} quality`;
+    `${presetLabel(state.preset)} quality` +
+    (denseWanted() ? ' · dense cloud follows' : '');
 
   showProcessing();
   fillMosaic(state.frameUrls);
@@ -1185,6 +1222,10 @@ async function showResult(scanId, status) {
   viewer.clear();
   viewer.setScale(status.scale?.status === 'scaled' ? status.scale.mmPerUnit : null);
   setMeasuring(false);
+  stopDensePoll();
+  Object.assign(clouds, { shown: 'sparse', sparseUrl: null, denseUrl: null, cameras: [] });
+  renderCloudToggle();
+  renderDense(status);
   viewer.start();
   // The canvas only has a real size once the result view is visible.
   requestAnimationFrame(() => viewer.resize());
@@ -1201,6 +1242,9 @@ async function showResult(scanId, status) {
     }
     if (scanId !== state.scanId) return;
 
+    Object.assign(clouds, { sparseUrl: result.plyUrl, denseUrl: result.densePlyUrl, cameras });
+    renderDense(result);
+    if (DENSE_RUNNING.has(result.dense?.status)) startDensePoll(scanId);
     const loaded = await viewer.load(result.plyUrl, cameras);
     el.statPoints.textContent = loaded.points.toLocaleString();
     viewer.setCamerasVisible(el.showCameras.checked);
@@ -1217,6 +1261,161 @@ async function showResult(scanId, status) {
       message: error.message,
       hints: ['The .PLY file is still on disk — open the scan folder to find it'],
     });
+  }
+}
+
+// ── dense cloud ─────────────────────────────────────────────────────────────
+
+const DENSE_RUNNING = new Set(['queued', 'undistorting', 'stereo', 'fusing']);
+const DENSE_STAGE_TEXT = {
+  queued: 'Starting…',
+  undistorting: 'Undistorting images',
+  stereo: 'Computing depth maps',
+  fusing: 'Fusing depth maps',
+};
+
+/** Is the dense cloud trusted for the scale bar and Measure (same frame as the sparse model)? */
+const denseSameFrame = (status) => status?.dense?.sameFrame === true;
+
+/** The strip in the viewer's corner: progress, the result, or why there is no dense cloud. */
+function renderDense(status) {
+  const dense = status.dense;
+  const available = Boolean(state.system?.dense?.available);
+  const strip = el.denseStrip;
+  const action = el.btnDenseAction;
+  el.cloudToggle.hidden = !(dense?.status === 'complete' && clouds.denseUrl);
+  el.btnExportDense.hidden = dense?.status !== 'complete';
+  action.hidden = true;
+  el.denseBar.hidden = true;
+
+  if (!dense) {
+    // Never asked for: offer it where it can run, stay quiet where it cannot.
+    strip.hidden = !(available && status.status === 'complete');
+    strip.dataset.state = 'none';
+    el.denseText.textContent = 'not made';
+    action.hidden = false;
+    action.textContent = 'Make dense cloud';
+    action.dataset.action = 'start';
+    return;
+  }
+  strip.hidden = false;
+  strip.dataset.state = dense.status;
+  if (DENSE_RUNNING.has(dense.status)) {
+    el.denseText.textContent =
+      `${DENSE_STAGE_TEXT[dense.status]}${dense.detail ? ` · ${dense.detail}` : ''} · ` +
+      `${dense.progress || 0}%`;
+    el.denseBar.hidden = false;
+    el.denseFill.style.width = `${dense.progress || 0}%`;
+    action.hidden = false;
+    action.textContent = 'Cancel';
+    action.dataset.action = 'cancel';
+  } else if (dense.status === 'complete') {
+    el.denseText.textContent =
+      `${(dense.points || 0).toLocaleString()} points · ${Math.round(dense.totalSeconds || 0)} s` +
+      (denseSameFrame(status)
+        ? ''
+        : ' · not used for measuring: its cameras did not match the sparse model');
+  } else {
+    const label = { failed: 'failed', cancelled: 'cancelled', unavailable: 'not available' }[
+      dense.status
+    ];
+    el.denseText.textContent = `${label || dense.status}: ${dense.reason || 'no reason recorded'}`;
+    if (available && dense.status !== 'unavailable') {
+      action.hidden = false;
+      action.textContent = 'Try again';
+      action.dataset.action = 'start';
+    }
+  }
+}
+
+function startDensePoll(scanId) {
+  stopDensePoll();
+  clouds.pollTimer = setInterval(() => pollDense(scanId), 1000);
+}
+
+function stopDensePoll() {
+  clearInterval(clouds.pollTimer);
+  clouds.pollTimer = null;
+}
+
+async function pollDense(scanId) {
+  let status;
+  try {
+    status = await api(`/api/scans/${scanId}/status`);
+  } catch {
+    return; // a missed poll is retried on the next tick
+  }
+  if (scanId !== state.scanId) {
+    stopDensePoll();
+    return;
+  }
+  state.result = status;
+  if (DENSE_RUNNING.has(status.dense?.status)) {
+    renderDense(status);
+    return;
+  }
+  stopDensePoll();
+  if (status.dense?.status === 'complete') {
+    try {
+      clouds.denseUrl = (await api(`/api/scans/${scanId}/result`)).densePlyUrl;
+    } catch {
+      /* the strip still reports the outcome */
+    }
+    toast('Dense cloud ready: switch with Sparse / Dense above the viewer.');
+  }
+  renderDense(status);
+  refreshLibrary();
+}
+
+async function denseAction() {
+  const scanId = state.scanId;
+  if (!scanId) return;
+  try {
+    if (el.btnDenseAction.dataset.action === 'cancel') {
+      stopDensePoll();
+      await postJSON(`/api/scans/${scanId}/cancel`);
+      state.result = await api(`/api/scans/${scanId}/status`);
+      renderDense(state.result);
+    } else {
+      if (clouds.shown === 'dense') await showCloud('sparse');
+      clouds.denseUrl = null;
+      state.result = await postJSON(`/api/scans/${scanId}/dense`);
+      renderDense(state.result);
+      startDensePoll(scanId);
+    }
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+function renderCloudToggle() {
+  for (const button of el.cloudToggle.querySelectorAll('button')) {
+    button.setAttribute('aria-checked', String(button.dataset.cloud === clouds.shown));
+  }
+}
+
+/** Swap the viewer between the sparse and the dense cloud; both share one model frame. */
+async function showCloud(name) {
+  const url = name === 'dense' ? clouds.denseUrl : clouds.sparseUrl;
+  if (!url || !state.viewer || name === clouds.shown) return;
+  setMeasuring(false);
+  el.viewerLoading.hidden = false;
+  try {
+    const loaded = await state.viewer.load(url, clouds.cameras, { keepView: true });
+    clouds.shown = name;
+    el.statPoints.textContent = loaded.points.toLocaleString();
+    state.viewer.setPointSize(Number(el.pointSize.value));
+    state.viewer.setCamerasVisible(el.showCameras.checked);
+    // The scale belongs to the sparse model's frame: an unconfirmed dense cloud gets none.
+    const scaled = state.result?.scale?.status === 'scaled';
+    const trusted = name === 'sparse' || denseSameFrame(state.result);
+    state.viewer.setScale(scaled && trusted ? state.result.scale.mmPerUnit : null);
+    el.btnMeasure.hidden = !(scaled && trusted);
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    el.viewerLoading.hidden = true;
+    renderCloudToggle();
   }
 }
 
@@ -1312,12 +1511,17 @@ function renderMeasure({ picks, mm, missed }) {
   value.textContent = `${formatMm(mm)} mm`;
   box.append(
     value,
-    ` ± ${sig2((mm * pct) / 100 || 0)} mm (scale only) · between two reconstructed points · click again to restart`,
+    ` ± ${sig2((mm * pct) / 100 || 0)} mm (scale only) · between two ` +
+      `${clouds.shown === 'dense' ? 'dense' : 'reconstructed'} points · click again to restart`,
   );
 }
 
 function resetToReady() {
   stopPolling();
+  stopDensePoll();
+  el.denseStrip.hidden = true;
+  el.cloudToggle.hidden = true;
+  el.btnExportDense.hidden = true;
   stopCapture();
   forgetFrames();
   state.scanId = null;
@@ -1950,6 +2154,23 @@ el.btnExport.addEventListener('click', () => {
   link.click();
 });
 
+el.btnExportDense.addEventListener('click', () => {
+  if (!state.scanId) return;
+  const link = document.createElement('a');
+  link.href = `/api/scans/${state.scanId}/dense.ply`;
+  link.download = `${state.scanId}-dense.ply`;
+  link.click();
+});
+el.btnDenseAction.addEventListener('click', denseAction);
+el.cloudToggle.addEventListener('click', (event) => {
+  const button = event.target.closest('button[data-cloud]');
+  if (button) showCloud(button.dataset.cloud);
+});
+el.denseToggle.addEventListener('change', (event) => {
+  state.dense = event.target.checked;
+  storageSet('dense', String(state.dense));
+});
+
 el.btnOpenFolder.addEventListener('click', async () => {
   if (!state.scanId) return;
   try {
@@ -1997,6 +2218,7 @@ el.btnSaveColmap.addEventListener('click', async () => {
   try {
     const payload = await postJSON('/api/system/colmap', { path: el.colmapPath.value });
     state.system.colmap = payload.colmap;
+    state.system.dense = payload.dense;
     renderEngine();
     toast('COLMAP configured.');
   } catch (error) {
@@ -2007,6 +2229,7 @@ el.btnSaveColmap.addEventListener('click', async () => {
 el.btnDetectColmap.addEventListener('click', async () => {
   const payload = await postJSON('/api/system/colmap/detect');
   state.system.colmap = payload.colmap;
+  state.system.dense = payload.dense;
   renderEngine();
   toast(payload.colmap.available ? 'COLMAP detected.' : 'COLMAP still not found.');
 });
@@ -2018,6 +2241,7 @@ el.btnImport.addEventListener('click', async () => {
       folder: el.importFolder.value,
       preset: state.preset,
       markerSizeMm: markerSizeSetting(),
+      dense: denseWanted(),
     });
     forgetFrames();
     state.scanId = scan.id;

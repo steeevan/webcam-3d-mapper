@@ -41,6 +41,9 @@ and the COLMAP pipeline.
   [Real-world scale](#real-world-scale-the-marker-board)).
 - **Find report** — a two-page PDF: top, front, side and bottom views with mm scale bars, a
   photograph, the record and the capture log (see [Find report](#find-report)).
+- **Dense cloud (NVIDIA GPU, opt-in)** — after the scan is complete, COLMAP's patch-match
+  stereo can add a dense point cloud in the same model frame, shown with a Sparse / Dense
+  toggle (see [Dense cloud](#dense-cloud-nvidia-gpu)).
 
 ### What it is not
 
@@ -50,8 +53,8 @@ sensor: 3D structure is inferred from how the scene shifts as the camera moves. 
 - A single-camera reconstruction has **no real-world scale of its own**. Only a scan made with
   the printed [marker board](#real-world-scale-the-marker-board) in view gets millimetres;
   every other scan is relative and says so ("unscaled") in the viewer and the report.
-- It stops at a **sparse** point cloud. No dense stereo, no mesh, no texture. Measurements are
-  between reconstructed points, not on a surface.
+- It makes a **sparse** point cloud, plus an optional dense one on a computer with an NVIDIA
+  GPU. No mesh, no texture. Measurements are between reconstructed points, not on a surface.
 
 ---
 
@@ -63,7 +66,7 @@ sensor: 3D structure is inferred from how the scene shifts as the camera moves. 
 | **COLMAP** | 3.8+ or 4.x — see [Installing COLMAP](#installing-colmap) |
 | **Webcam** | any device the browser can open |
 | **Browser** | Chrome, Edge or Firefox (needs `getUserMedia` + WebGL2 + import maps) |
-| **GPU** | not required; the CPU-only COLMAP build works fine. With an NVIDIA GPU and the CUDA build, feature detection and matching run on the GPU automatically |
+| **GPU** | not required; the CPU-only COLMAP build works fine. With an NVIDIA GPU and the CUDA build, feature detection and matching run on the GPU automatically, and the optional dense cloud becomes available |
 
 ---
 
@@ -161,9 +164,11 @@ green **3D Engine** dot once it is working.
 | **Balanced** | 1600 px, 8k features | 55/56 frames, 2,441 points, 82 s |
 | **Detailed** | 1600 px, 12k DSP-SIFT features with affine shapes, guided matching | 56/56 frames, 4,150 points, 165 s |
 
-> **Why no dense point cloud?** COLMAP's dense stereo (`patch_match_stereo`) requires CUDA.
-> On a CPU-only build it stops with *"Dense stereo reconstruction requires CUDA"*. Detailed
-> is the densest result the CPU pipeline can produce.
+> **Dense cloud:** Detailed is the densest result the CPU pipeline can produce. COLMAP's
+> dense stereo (`patch_match_stereo`) needs CUDA; on a CPU-only build it stops with *"Dense
+> stereo reconstruction requires CUDA"* (checked with 3.8, 3.11.1 and 4.2.0). With the CUDA
+> build and an NVIDIA GPU, tick **Dense cloud** before scanning — see
+> [Dense cloud](#dense-cloud-nvidia-gpu).
 
 ### Live tracking
 
@@ -388,9 +393,103 @@ test cube spans exactly its size in pixels), and no WebGL needed. They use the v
 frame — the average camera up becomes +Y — then turn the model about +Y so its longest
 horizontal axis runs left to right. For a scaled scan, only points standing on the sheet inside
 the marker ring are drawn, which isolates the find from the table and the room; otherwise the
-points within the 90th-percentile radius. The PDF itself comes from a small writer in
+points within the 90th-percentile radius. When the scan has a dense cloud that passed the
+same-frame check (see [Dense cloud](#dense-cloud-nvidia-gpu)), the views are drawn from it
+instead (at most 400,000 of its points, evenly strided, 1-pixel dots), and the caption and the
+capture log say so. The PDF itself comes from a small writer in
 `backend/pdf.py` (Helvetica, vector shapes, embedded images) rather than a new dependency. Its
 limit: text outside Windows-1252 (e.g. Greek or Cyrillic site names) prints as "?".
+
+## Dense cloud (NVIDIA GPU)
+
+An opt-in step after the sparse reconstruction, for computers with an NVIDIA GPU and the CUDA
+build of COLMAP (`python scripts/get_colmap.py --cuda --force`):
+
+```
+sparse model (sparse/N) → image_undistorter → patch_match_stereo → stereo_fusion → result/dense.ply
+```
+
+**Offered only where it can run.** The **Dense cloud · NVIDIA GPU** box in the capture bar is
+enabled only when COLMAP is a CUDA build, `nvidia-smi` reports a GPU, and no GPU stage has
+failed since the server started — the same conditions under which SIFT runs on the GPU.
+Otherwise it is greyed out with the reason ("CPU-only COLMAP build", "no NVIDIA GPU found",
+"GPU failed earlier"), and Settings → Reconstruction engine gives the full sentence. A finished
+scan can also get a dense cloud later: **Make dense cloud** in the viewer's corner.
+
+**It cannot break a scan.** The scan is marked complete — sparse cloud, scale, report — before
+the dense step starts, and the dense step only ever writes its own note in `scan.json`
+(`"dense"`). A failure, a timeout (60 minutes per stage) or **Cancel** ends as
+*"Dense cloud failed: …"* / *"cancelled"* in the viewer, with the reason, and the scan stays
+complete. A CUDA error in patch-match keeps the server on the CPU afterwards, like a GPU failure
+during SIFT (Settings → Re-detect resets it).
+
+**Settings per preset.** The undistorted images, and with them the depth maps, are limited to
+the preset's size; the other patch-match and fusion settings are COLMAP's defaults, with
+geometric consistency on (photometric pass, then geometric pass, then fusion of the filtered
+geometric maps).
+
+| Preset | Dense image size (longest side) | the real 57-frame scan's 1280×720 frames became |
+|---|---|---|
+| Fast | 640 px | 640×352 |
+| Balanced | 1024 px | 1024×562 |
+| Detailed | 1600 px | 1320×725 (full size: undistorting that lens widened the frame a little) |
+
+**Progress** comes from COLMAP's own lines: "Undistorting image [i/N]", "Processing view i / N"
+(printed twice per image, once per pass) and "Fusing image [i/N]".
+
+**Same frame as the sparse model — checked on every run.** `image_undistorter` copies the
+sparse model's poses into `dense/sparse`, and `stereo_fusion` back-projects every depth pixel
+with those poses (`src/colmap/mvs/fusion.cc`), so `dense.ply` is in the sparse model's frame
+exactly when those cameras are. Each run compares the camera centres of the two models; the
+largest difference, relative to the camera spread, is stored as `frameOffset`. Only when it is
+below 10⁻⁶ (`sameFrame`) is the dense cloud used for the scale bar, the **Measure** tool and the
+report's orthographic views; otherwise it is shown but not measured. Measured with COLMAP 4.2.0:
+the offset was exactly 0.0 for three real webcam scans (55, 57 and 86 placed frames) and for
+the synthetic find at all three presets.
+
+**Disk.** Depth and normal maps are big: for every image, a photometric and a geometric depth
+map (4 bytes per pixel) and normal map (12 bytes per pixel). After a successful fusion the
+whole `dense/` workspace is deleted — also after a failure or cancel — and only
+`result/dense.ply` (27 bytes per point) and the log stay. Peak size of the workspace while it
+runs:
+
+| Scan | Fast | Balanced | Detailed |
+|---|---|---|---|
+| synthetic find, 60 frames (measured, ideal depth maps, see below) | 478 MB | 1.19 GB | 1.85 GB |
+| real webcam scan, 57 frames, scan folder 55 MB (maps computed from their fixed file size) | 0.42 GB | 1.07 GB | 1.77 GB |
+
+Scans can have up to 180 frames, so Detailed can need ~5.5 GB free while it runs.
+
+**What was measured without a GPU, and how.** This was built on a computer without an NVIDIA
+GPU, so `patch_match_stereo` itself has **not** been run. `scripts/dense_check.py --ideal` runs
+the app's own dense stage with the real `image_undistorter` and `stereo_fusion` (COLMAP 4.2.0),
+but replaces patch-match with exact depth and normal maps ray-cast from the synthetic scene's
+true geometry. That tests the frame, the scale, the file handling and the measuring — not the
+depth estimation. Points are taken into the board's frame with the marker scale and board pose
+measured on the sparse model, exactly as the viewer's scale bar and Measure tool do. The box's
+top is the median of the points within ±0.5 mm of the height histogram's peak (a loose band,
+everything above half the height, takes in the side faces and reads 24–27 mm):
+
+| Preset | dense points | top of box above the sheet (true 28 mm) | top face (true 64 × 42 mm) | fused points vs true surface: median / 95% |
+|---|---|---|---|---|
+| Fast | 83,805 | 27.997 mm | 63.99 × 42.00 mm | 0.012 / 0.054 mm |
+| Balanced | 220,118 | 27.998 mm | 64.14 × 42.02 mm | 0.007 / 0.034 mm |
+| Detailed | 336,803 | 27.999 mm | 64.10 × 42.03 mm | 0.006 / 0.027 mm |
+
+The sparse ground-truth points measured with the same code: 28.001 mm, 64.00 × 42.00 mm.
+
+**Not measured yet (needs an NVIDIA GPU):** patch-match's time, GPU memory, point count and
+accuracy, on the synthetic find and on a real scan. Run, on such a machine:
+
+```bash
+python scripts/dense_check.py --images .cache/findscene --preset fast --runs 3
+python scripts/dense_check.py --images .cache/findscene --preset balanced --runs 3
+python scripts/dense_check.py --scan scans/<a finished scan>        # a copy; the scan is not touched
+```
+
+Until then, treat the dense cloud's accuracy as unknown: it inherits the sparse model's scale
+and its ± (which covers the scale only), but the depth maps can add their own noise and
+outliers, especially on shiny or untextured surfaces.
 
 ---
 
@@ -429,6 +528,11 @@ and larger scans take proportionally longer. A CUDA build plus an NVIDIA GPU is 
 and the app switches to GPU SIFT automatically when both are present (`get_colmap.py` picks the
 CUDA build on such machines). Detailed uses CPU-only SIFT refinements, so it stays on the CPU
 for feature detection either way.
+
+**Dense cloud not available** — the capture bar says why. "CPU-only COLMAP build": run
+`python scripts/get_colmap.py --cuda --force`. "no NVIDIA GPU found": `nvidia-smi` must work from
+a command prompt. "GPU failed earlier": see the log of the scan that failed, then Settings →
+Re-detect.
 
 **Nothing visible in the viewer** — the view is auto-framed on load; press **Reset view** if you
 have orbited away. Very small clouds may need the **Point size** slider.
@@ -469,6 +573,7 @@ webcam-3d-mapper/
 │   ├── get_colmap.py       downloads the right COLMAP build into vendor/colmap/ (Windows)
 │   ├── make_test_scene.py  renders a synthetic room or find-on-the-board sequence (+ ground truth)
 │   ├── scale_accuracy.py   scale error against ground truth
+│   ├── dense_check.py      dense cloud: points, time, disk, accuracy (also without a GPU: --ideal)
 │   └── ui_smoke.py         headless-browser smoke test
 └── tests/test_mapper.py
 ```
@@ -481,7 +586,9 @@ scans/2026-09-24_143001_ab12/
 ├── database.db
 ├── sparse/0/               COLMAP model
 ├── preview/                live-preview workspace (own database while capturing; last cloud after)
+├── dense/                  dense workspace, only while the dense step runs
 ├── result/map.ply          exported point cloud
+├── result/dense.ply        dense point cloud (optional, NVIDIA GPU)
 ├── result/cameras.json     reconstructed cameras (position, forward, up)
 ├── result/thumbnail.jpg    library preview
 ├── logs/colmap.log         raw COLMAP output
@@ -517,10 +624,12 @@ No database — the filesystem is the state.
 | `GET` | `/api/scans/{id}/metrics` | comparison numbers, incl. mean track length and reprojection error |
 | `GET` | `/api/scans/{id}/result` | result summary + asset URLs |
 | `GET` | `/api/scans/{id}/map.ply` | the point cloud |
+| `POST` | `/api/scans/{id}/dense` | make (or remake) the dense cloud of a complete scan; 409 with the reason if unavailable |
+| `GET` | `/api/scans/{id}/dense.ply` | the dense point cloud |
 | `GET` | `/api/scans/{id}/cameras.json` | camera trajectory |
 | `GET` | `/api/scans/{id}/thumbnail.jpg` | library preview (after capture ends) |
 | `GET` | `/api/scans/{id}/log` | raw COLMAP log |
-| `POST` | `/api/scans/{id}/cancel` | cancel a running reconstruction |
+| `POST` | `/api/scans/{id}/cancel` | cancel a running reconstruction, or the dense step of a complete scan |
 | `POST` | `/api/scans/{id}/reveal` | open the scan folder |
 | `DELETE` | `/api/scans/{id}` | delete a scan |
 | `POST` | `/api/dev/import` | reconstruct a folder of existing images |
@@ -569,12 +678,12 @@ python scripts/ui_smoke.py --images .cache/testscene --screenshots .cache/shots
 
 ## Roadmap
 
-Deliberately out of scope: dense stereo, meshing, texturing, loop closure, NeRF / Gaussian
-splatting, SLAM, depth cameras. Metric scale exists only through the printed marker board.
+Deliberately out of scope: dense stereo without CUDA, meshing, texturing, loop closure,
+NeRF / Gaussian splatting, SLAM, depth cameras. Metric scale exists only through the printed marker board.
 
-Next most useful additions: a real printed-board accuracy check, a CUDA-gated dense step for
-machines with an NVIDIA GPU, a Unicode font for the report, and an elevation (up/down)
-dimension for the coverage guide.
+Next most useful additions: a real printed-board accuracy check, measuring the dense step on
+an NVIDIA GPU (see [Dense cloud](#dense-cloud-nvidia-gpu)), a Unicode font for the report, and
+an elevation (up/down) dimension for the coverage guide.
 
 ---
 

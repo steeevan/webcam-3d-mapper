@@ -1186,3 +1186,46 @@ html[data-busy="true"] .library-list { opacity: .5; pointer-events: none; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001s !important; animation-iteration-count: 1 !important; transition-duration: .001s !important; }
 }
+
+/* ── Dense cloud (NVIDIA GPU) ─────────────────────────────────────────────── */
+
+.dense-row { display: flex; align-items: center; gap: 10px; height: 36px; }
+.dense-field .dense-choice:has(input:disabled) { cursor: not-allowed; opacity: .55; }
+.field-note {
+  max-width: 150px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-faint);
+}
+.field-note:empty { display: none; }
+
+.segmented-sm { height: 30px; padding: 2px; }
+.segmented-sm button { padding: 0 11px; font-size: 12px; }
+.segmented button:disabled { opacity: .45; cursor: not-allowed; }
+.segmented[hidden] { display: none; }
+
+.dense-strip {
+  position: absolute;
+  right: 14px; bottom: 14px;
+  width: 300px;
+  max-width: calc(100% - 28px);
+  display: flex; flex-direction: column; gap: 7px;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(10,13,17,.82);
+  backdrop-filter: blur(8px);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+.dense-strip[hidden] { display: none; }
+.dense-head b { color: var(--text); font-weight: 600; margin-right: 6px; }
+.dense-strip[data-state="failed"] { border-color: rgba(244,191,95,.4); }
+.dense-strip[data-state="failed"] .dense-head b,
+.dense-strip[data-state="cancelled"] .dense-head b { color: var(--warn); }
+.dense-strip[data-state="complete"] .dense-head b { color: var(--accent); }
+.dense-bar { height: 4px; border-radius: 2px; background: var(--bg-elev-2); overflow: hidden; }
+.dense-bar[hidden] { display: none; }
+.dense-bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .4s; }
+.dense-strip .btn { align-self: flex-start; }

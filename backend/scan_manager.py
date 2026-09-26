@@ -7,7 +7,8 @@ One scan == one directory under ``scans/``. The filesystem *is* the database:
         database.db      COLMAP feature/match database
         sparse/          COLMAP models (0/, 1/, ...)
         preview/         live-preview workspace (own database, models, per-round output)
-        result/          map.ply, cameras.json
+        dense/           dense workspace while the optional dense stage runs (then removed)
+        result/          map.ply, cameras.json, dense.ply (optional)
         logs/colmap.log  raw COLMAP output
         scan.json        status, statistics, find record, capture details, scale
 
@@ -42,6 +43,9 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Dense-stage states in which COLMAP is (or is about to be) running.
+DENSE_RUNNING = frozenset({"queued", "undistorting", "stereo", "fusing"})
 
 #: ``2026-09-24_143001_ab12`` - date, time, 4 hex chars. Anything else is rejected outright.
 SCAN_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}_[0-9a-f]{4}$")
@@ -84,6 +88,10 @@ class ScanSession:
         self.marker_size_mm: float | None = None
         #: Outcome of the marker-board scale estimate (see scale.py), or None if never run.
         self.scale: dict[str, Any] | None = None
+        #: The person asked for a dense cloud (NVIDIA GPU) when starting the scan.
+        self.dense_requested: bool = False
+        #: State of the optional dense stage (see reconstruction.run_dense), None if never run.
+        self.dense: dict[str, Any] | None = None
 
         # Capture-time state, never persisted.
         self.quality_filter = FrameQualityFilter()
@@ -135,6 +143,15 @@ class ScanSession:
         """Live-preview workspace. Nothing in here is read by the final reconstruction."""
         return self.root / "preview"
 
+    @property
+    def dense_dir(self) -> Path:
+        """Dense workspace (undistorted images, depth and normal maps); removed after fusion."""
+        return self.root / "dense"
+
+    @property
+    def dense_ply_path(self) -> Path:
+        return self.result_dir / "dense.ply"
+
     # -- mutation --------------------------------------------------------------
 
     def set_status(
@@ -159,6 +176,14 @@ class ScanSession:
     def fail(self, error: ScanError) -> None:
         self.error = error
         self.set_status(ScanStatus.FAILED)
+
+    def set_dense(self, save: bool = True, **fields: Any) -> None:
+        """Update the dense stage's state. It never touches ``status``: a scan whose dense
+        cloud failed is still a complete scan with its sparse cloud."""
+        self.dense = {**(self.dense or {}), **fields}
+        self.updated_at = time.time()
+        if save:
+            self.save()
 
     def append_log(self, text: str) -> None:
         try:
@@ -251,6 +276,8 @@ class ScanSession:
             "colmapVersion": self.colmap_version,
             "markerSizeMm": self.marker_size_mm,
             "scale": self.scale,
+            "denseRequested": self.dense_requested,
+            "dense": self.dense,
         }
 
     def save(self) -> None:
@@ -300,6 +327,12 @@ class ScanSession:
         session.marker_size_mm = float(size) if isinstance(size, (int, float)) and size > 0 else None
         scale = data.get("scale")
         session.scale = scale if isinstance(scale, dict) else None
+        session.dense_requested = data.get("denseRequested") is True
+        dense = data.get("dense")
+        session.dense = dict(dense) if isinstance(dense, dict) else None
+        if session.dense and session.dense.get("status") in DENSE_RUNNING:
+            # Like an interrupted sparse run: it cannot be resumed. The sparse scan is intact.
+            session.dense.update(status="cancelled", reason="the server stopped while it ran")
 
         if data.get("result"):
             session.result = ReconstructionResult(**data["result"])
@@ -346,6 +379,7 @@ class ScanManager:
         record: dict[str, str] | None = None,
         camera: str = "",
         marker_size_mm: float | None = None,
+        dense: bool = False,
     ) -> ScanSession:
         """Start a scan. ``record`` must already be validated (``validate_record``)."""
         if preset not in config.PRESETS:
@@ -361,6 +395,7 @@ class ScanManager:
         session.source = source
         session.record = record
         session.marker_size_mm = marker_size_mm
+        session.dense_requested = bool(dense)
         camera = clean_text(camera)[:120]
         if camera:
             session.capture["camera"] = camera

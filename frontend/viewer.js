@@ -206,15 +206,16 @@ export class PointCloudViewer {
 
   /**
    * Load a PLY point cloud, oriented by the reconstructed cameras when available.
-   * Resolves with `{ points }`.
+   * Resolves with `{ points }`. With `keepView`, the camera stays exactly where it is: for
+   * swapping between two clouds of the same model frame (sparse and dense).
    */
-  load(url, cameras = []) {
+  load(url, cameras = [], { keepView = false } = {}) {
     return new Promise((resolve, reject) => {
       new PLYLoader().load(
         url,
         (geometry) => {
           try {
-            resolve(this._install(geometry, cameras));
+            resolve(this._install(geometry, cameras, keepView && this.points ? this._saveView() : null));
           } catch (err) {
             reject(err);
           }
@@ -225,7 +226,18 @@ export class PointCloudViewer {
     });
   }
 
-  _install(geometry, cameras) {
+  _saveView() {
+    return {
+      position: this.camera.position.clone(),
+      target: this.controls.target.clone(),
+      near: this.camera.near,
+      far: this.camera.far,
+      minDistance: this.controls.minDistance,
+      maxDistance: this.controls.maxDistance,
+    };
+  }
+
+  _install(geometry, cameras, view = null) {
     this.clear();
     this.clearMeasure();
 
@@ -278,8 +290,18 @@ export class PointCloudViewer {
 
     this._buildCameras(cameras);
     this._buildGrid();
-    this.resetView();
-    this._intro = this.playIntro ? { start: performance.now() } : null;
+    if (view) {
+      this.camera.position.copy(view.position);
+      this.controls.target.copy(view.target);
+      Object.assign(this.camera, { near: view.near, far: view.far });
+      this.camera.updateProjectionMatrix();
+      Object.assign(this.controls, { minDistance: view.minDistance, maxDistance: view.maxDistance });
+      this.controls.update();
+      this._intro = null;
+    } else {
+      this.resetView();
+      this._intro = this.playIntro ? { start: performance.now() } : null;
+    }
     return { points: positions.count };
   }
 

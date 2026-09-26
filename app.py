@@ -34,7 +34,12 @@ from backend.find_record import FIELD_LIMITS, MATERIALS, RecordError, validate_r
 from backend.image_quality import decode_jpeg, make_thumbnail
 from backend.models import STAGE_SEQUENCE, FrameDecision, ScanStatus
 from backend.preview import LivePreview
-from backend.reconstruction import ReconstructionPipeline, read_camera_centers, read_point_stats
+from backend.reconstruction import (
+    ReconstructionPipeline,
+    dense_support,
+    read_camera_centers,
+    read_point_stats,
+)
 from backend.report import build_report, capture_log, report_filename, scale_uncertainty_pct
 from backend.scale import measure_session
 from backend.scan_manager import InvalidScanIdError, ScanNotFoundError, ScanSession
@@ -153,6 +158,7 @@ async def system_info() -> dict[str, Any]:
     info = colmap.detect()
     return {
         "colmap": info.to_dict(),
+        "dense": _dense_info(),
         "capture": {
             "intervalMs": config.CAPTURE_INTERVAL_MS,
             "maxFrames": config.MAX_ACCEPTED_FRAMES,
@@ -163,7 +169,12 @@ async def system_info() -> dict[str, Any]:
             "jpegQuality": 0.9,
         },
         "presets": [
-            {"name": preset.name, "label": preset.label, "description": preset.description}
+            {
+                "name": preset.name,
+                "label": preset.label,
+                "description": preset.description,
+                "denseMaxImageSize": preset.dense_max_image_size,
+            }
             for preset in config.PRESETS.values()
         ],
         "defaultPreset": config.DEFAULT_PRESET,
@@ -181,6 +192,12 @@ async def system_info() -> dict[str, Any]:
     }
 
 
+def _dense_info() -> dict[str, Any]:
+    """The optional dense cloud: offered only with a CUDA build and an NVIDIA GPU."""
+    available, short, reason = dense_support(colmap)
+    return {"available": available, "short": short, "reason": reason}
+
+
 @app.post("/api/system/colmap")
 async def set_colmap_path(payload: dict[str, str]) -> dict[str, Any]:
     """Point the app at a COLMAP executable and persist the choice."""
@@ -191,13 +208,13 @@ async def set_colmap_path(payload: dict[str, str]) -> dict[str, Any]:
         info = await asyncio.to_thread(colmap.set_path, path)
     except ColmapNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    return {"colmap": info.to_dict()}
+    return {"colmap": info.to_dict(), "dense": _dense_info()}
 
 
 @app.post("/api/system/colmap/detect")
 async def redetect_colmap() -> dict[str, Any]:
     info = await asyncio.to_thread(colmap.detect, True)
-    return {"colmap": info.to_dict()}
+    return {"colmap": info.to_dict(), "dense": _dense_info()}
 
 
 # --------------------------------------------------------------------------------------
@@ -216,7 +233,8 @@ async def list_scans(q: str = "") -> dict[str, Any]:
 @app.post("/api/scans")
 async def create_scan(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     """Start a scan. Optional: ``record`` (the find record), ``camera`` (the browser's camera
-    label, for the capture log) and ``markerSizeMm`` (the printed board as measured)."""
+    label, for the capture log), ``markerSizeMm`` (the printed board as measured) and ``dense``
+    (true: make a dense cloud after the sparse one, if this machine can)."""
     payload = payload or {}
     preset = payload.get("preset", config.DEFAULT_PRESET)
     record = _record_or_422(payload["record"]) if payload.get("record") else None
@@ -226,6 +244,7 @@ async def create_scan(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         record=record,
         camera=camera if isinstance(camera, str) else "",
         marker_size_mm=_marker_size(payload.get("markerSizeMm")),
+        dense=payload.get("dense") is True,
     )
     _start_preview(session)
     return _status_payload(session)
@@ -406,6 +425,45 @@ def _start_reconstruction(session: ScanSession) -> None:
     _tasks[session.id] = asyncio.create_task(job(), name=f"reconstruct:{session.id}")
 
 
+def _start_dense(session: ScanSession) -> None:
+    async def job() -> None:
+        try:
+            await ReconstructionPipeline(session).run_dense()
+        finally:
+            session.save()
+            _tasks.pop(session.id, None)
+
+    _tasks[session.id] = asyncio.create_task(job(), name=f"dense:{session.id}")
+
+
+async def _stop_task(scan_id: str) -> None:
+    """Cancel a scan's running job and wait (briefly) until its COLMAP is gone, so its state is
+    final and its files are no longer open."""
+    task = _tasks.pop(scan_id, None)
+    if task is None:
+        return
+    task.cancel()
+    await asyncio.wait({task}, timeout=30)
+
+
+@app.post("/api/scans/{scan_id}/dense")
+async def make_dense(scan_id: str) -> dict[str, Any]:
+    """Make (or remake) the dense cloud of a complete scan. The scan stays complete whatever
+    happens; progress and the outcome appear under ``dense`` in the status."""
+    session = _session(scan_id)
+    if session.status != ScanStatus.COMPLETE:
+        raise HTTPException(status_code=409, detail="Scan is not complete")
+    if session.id in _tasks:
+        raise HTTPException(status_code=409, detail="This scan is already being processed")
+    available, _, reason = dense_support(colmap)
+    if not available:
+        raise HTTPException(status_code=409, detail=f"Dense cloud not available: {reason}")
+    session.dense_requested = True
+    session.set_dense(status="queued", progress=0, detail="", reason=None)
+    _start_dense(session)
+    return _status_payload(session)
+
+
 @app.get("/api/scans/{scan_id}/status")
 async def scan_status(scan_id: str) -> dict[str, Any]:
     return _status_payload(_session(scan_id))
@@ -474,6 +532,12 @@ async def scan_result(scan_id: str) -> dict[str, Any]:
     payload["camerasUrl"] = (
         f"/api/scans/{session.id}/cameras.json" if session.cameras_path.exists() else None
     )
+    dense = session.dense or {}
+    payload["densePlyUrl"] = (
+        f"/api/scans/{session.id}/dense.ply"
+        if dense.get("status") == "complete" and session.dense_ply_path.is_file()
+        else None
+    )
     return payload
 
 
@@ -486,6 +550,18 @@ async def scan_ply(scan_id: str) -> FileResponse:
         session.ply_path,
         media_type="application/octet-stream",
         filename=f"{session.id}.ply",
+    )
+
+
+@app.get("/api/scans/{scan_id}/dense.ply")
+async def scan_dense_ply(scan_id: str) -> FileResponse:
+    session = _session(scan_id)
+    if not session.dense_ply_path.is_file():
+        raise HTTPException(status_code=404, detail="No dense cloud for this scan")
+    return FileResponse(
+        session.dense_ply_path,
+        media_type="application/octet-stream",
+        filename=f"{session.id}-dense.ply",
     )
 
 
@@ -564,9 +640,7 @@ async def reveal_scan(scan_id: str) -> dict[str, Any]:
 async def delete_scan(scan_id: str) -> dict[str, Any]:
     # COLMAP must be gone before its files can be deleted on Windows.
     await _stop_preview(scan_id)
-    task = _tasks.pop(scan_id, None)
-    if task:
-        task.cancel()
+    await _stop_task(scan_id)
     try:
         scans.delete(scan_id)
     except InvalidScanIdError:
@@ -580,9 +654,8 @@ async def delete_scan(scan_id: str) -> dict[str, Any]:
 async def cancel_scan(scan_id: str) -> dict[str, Any]:
     session = _session(scan_id)
     await _stop_preview(scan_id, discard=True)
-    task = _tasks.pop(scan_id, None)
-    if task:
-        task.cancel()
+    # On a complete scan this stops only the dense stage; the scan itself stays complete.
+    await _stop_task(scan_id)
     if not session.status.is_terminal:
         session.set_status(ScanStatus.CANCELLED)
     return _status_payload(session)
@@ -616,6 +689,7 @@ async def dev_import(payload: dict[str, Any]) -> dict[str, Any]:
         preset=str((payload or {}).get("preset", config.DEFAULT_PRESET)),
         source="import",
         marker_size_mm=_marker_size((payload or {}).get("markerSizeMm")),
+        dense=(payload or {}).get("dense") is True,
     )
     for index, source in enumerate(sources[: config.MAX_ACCEPTED_FRAMES], start=1):
         await asyncio.to_thread(
