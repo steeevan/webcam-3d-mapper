@@ -1,0 +1,5 @@
+# Normalise line endings in the repo; check out each launcher the way its shell needs,
+# whatever core.autocrlf is set to on the cloning machine.
+* text=auto
+*.bat text eol=crlf
+*.sh text eol=lf
