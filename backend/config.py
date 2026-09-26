@@ -95,6 +95,13 @@ COVERAGE_MIN_CAMERAS: int = 3
 #: outside this is a typo, not a printer's rescaling.
 MARKER_SIZE_RANGE_MM: tuple[float, float] = (10.0, 60.0)
 
+#: Scale error shared by every marker, which the marker statistics cannot see: COLMAP's own
+#: camera-pose and focal-length errors rescale the whole model, all markers alike. Added to the
+#: statistical spread in quadrature to give the ± shown everywhere. Sized from full COLMAP runs
+#: on the synthetic find scene (README, "Real-world scale"); real webcam scans are unlikely to
+#: do better, so it is a floor, not a guarantee.
+SCALE_MODEL_ALLOWANCE_PCT: float = 0.3
+
 # --- Library thumbnails ---------------------------------------------------------
 
 LIBRARY_THUMBNAIL_WIDTH: int = 360

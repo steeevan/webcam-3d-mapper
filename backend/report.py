@@ -12,6 +12,7 @@ recorded", never guessed.
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime
 from typing import Any
@@ -19,7 +20,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from . import markers
+from . import config, markers
 from .find_record import material_label
 from .ortho import (
     VIEW_LABELS,
@@ -107,12 +108,21 @@ def capture_log(session, point_stats: dict[str, float] | None = None) -> dict[st
     }
 
 
+def statistical_spread_pct(scale: dict[str, Any]) -> float:
+    """The larger of the between-marker and frame-bootstrap spreads."""
+    values = [v for v in (scale.get("spreadPct"), scale.get("bootstrapPct")) if v is not None]
+    return max(values, default=0.0)
+
+
 def scale_uncertainty_pct(scale: dict[str, Any] | None) -> float | None:
-    """The ± shown everywhere: the larger of the between-marker and frame-bootstrap spreads."""
+    """The ± shown everywhere: the statistical spread and the model allowance, in quadrature.
+
+    The spreads alone measured 0.007-0.013% on full COLMAP runs whose real error was 0.04-0.23%:
+    they see scatter between markers and frames, not an error that rescales the whole model.
+    """
     if not scale or scale.get("status") != "scaled":
         return None
-    values = [v for v in (scale.get("spreadPct"), scale.get("bootstrapPct")) if v is not None]
-    return max(values) if values else None
+    return round(math.hypot(statistical_spread_pct(scale), config.SCALE_MODEL_ALLOWANCE_PCT), 3)
 
 
 def format_pct(value: float | None) -> str:
@@ -360,12 +370,14 @@ def build_report(session, version: str, generated: datetime | None = None) -> by
             f"Method: printed board {scale.get('board', markers.BOARD_NAME)}, "
             f"{scale.get('markerSizeMm', markers.MARKER_MM):g} mm markers; distances between "
             f"corresponding corners of different markers, triangulated with the reconstructed "
-            f"cameras. Median over markers; the ± is the larger of the between-marker spread "
-            f"({scale.get('spreadPct')}%) and a frame bootstrap ({scale.get('bootstrapPct')}%). "
+            f"cameras. Median over markers. The ± combines the marker statistics (the larger of "
+            f"the between-marker spread, {scale.get('spreadPct')}%, and a frame bootstrap, "
+            f"{scale.get('bootstrapPct')}%) with a {config.SCALE_MODEL_ALLOWANCE_PCT:g}% "
+            f"allowance for errors that rescale the whole model, measured on test scans. "
             f"Median corner reprojection error {scale.get('reprojectionErrorPx')} px; board "
             f"flatness RMS {scale.get('boardResidualMm')} mm; marker-edge check "
-            f"{scale.get('edgeCheckPct'):+.2f}%. The ± cannot show errors that affect every "
-            f"marker equally, such as a wrongly entered marker size."
+            f"{scale.get('edgeCheckPct'):+.2f}%. The ± cannot show a wrongly entered marker size "
+            f"or a board printed at the wrong scale."
         )
         y = page.paragraph(15, y + 1, details, 180, size=7.5, color=GREY)
         for warning in scale.get("warnings", []):

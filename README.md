@@ -329,9 +329,14 @@ squares, around an empty area where the find goes.
   refinement pulls the corners of a blurred black square inwards. The pull is the same for
   every marker, so it cancels between corresponding corners, which stayed within 0.02–0.09%.
 - Each marker's estimate is the median over its pairings; the scale is the median over
-  markers (at least 3). The **±** shown everywhere is the larger of two spreads: the robust
-  standard deviation between markers, and a bootstrap over frames (the frames are resampled 40
-  times), which also catches camera-pose errors that move all markers together.
+  markers (at least 3).
+- The **±** shown everywhere has two parts, added in quadrature:
+  - **Marker statistics**: the larger of the robust standard deviation between markers and a
+    bootstrap over frames (the frames are resampled 40 times).
+  - **A 0.3% model allowance** (`SCALE_MODEL_ALLOWANCE_PCT` in `backend/config.py`). COLMAP's
+    own errors in camera poses and focal length rescale the whole model, every marker alike.
+    The statistics cannot see that: on full COLMAP runs they read 0.004–0.013% while the real
+    error was up to 0.23% (measured below). The allowance is sized from those runs.
 - Two checks produce a warning instead of a quiet number: marker edges disagreeing with marker
   spacing by more than 2%, and a board-fit RMS over 1 mm (the sheet was not flat).
 
@@ -347,7 +352,7 @@ neither.
 1280×720, one circle at ~43 cm; `scripts/scale_accuracy.py --mode poses`, 10 runs per row, each
 in a new random model frame):
 
-| Camera poses given to the estimator | median error | max error | error within ± |
+| Camera poses given to the estimator | median error | max error | error within the marker statistics |
 |---|---|---|---|
 | exact | 0.002% | 0.002% | 0 of 10 (within 2×: 10) |
 | noise 0.5 mm / 0.05° per camera | 0.020% | 0.053% | 9 of 10 |
@@ -360,16 +365,23 @@ dropped to 25–50% at 45 cm, which is why the board uses 30 mm. None of the 334
 existing real scans produced a false detection.
 
 **Full COLMAP reconstructions** of the same synthetic scene (`scripts/scale_accuracy.py --runs 5`,
-Fast preset, CPU-only COLMAP 4.2.0, 2026-09-25): all 60 frames placed in every run, median
-error 0.13%, max 0.23%, **every run reading slightly small** (−0.08% to −0.23%). The reported ±
-was 0.007–0.013%, so the error fell within it in 0 of 5 runs, not even within 2×: on a COLMAP
-model the ± understates the real error by about ten times. The marker edge check read +0.42–0.43%
-in every run.
+CPU-only COLMAP 4.2.0, 2026-09-25). All 60 frames were placed in every run:
+
+| Preset | median error | max error | marker statistics | error within them | within ± (with allowance) |
+|---|---|---|---|---|---|
+| Fast | 0.13% | 0.23% | 0.007–0.013% | 0 of 5 | 5 of 5 |
+| Balanced | 0.048% | 0.075% | 0.004–0.006% | 0 of 5 | 5 of 5 |
+
+Every run read slightly small. The error rescales the whole model, not just the board: on one
+Fast run the box's top measured 27.98 mm above the board (true 28 mm, −0.08%), matching that
+run's board error, and COLMAP's focal length was 0.05% short. This is why the ± carries the
+0.3% allowance on top of the marker statistics.
 
 **Not measured:** any scan of a real printed board. Scan an object of known size on the board
-and compare. The ± cannot show errors that affect every marker equally — a wrongly entered
-marker size, or a model-wide distortion from poorly estimated intrinsics (the likely cause of
-the consistent bias above) — so treat it as a lower bound until a real check exists.
+and compare. The allowance is sized on clean synthetic frames; real webcams add lens
+distortion that SIMPLE_RADIAL may not fully model, rolling shutter and autofocus, so real
+errors may be larger. The ± still cannot show a wrongly entered marker size. Treat it as a
+lower bound until a real check exists.
 
 ## Find report
 
@@ -411,9 +423,13 @@ Settings panel lists every path that was searched.
 Windows **Smart App Control** (or an application control policy) refused to load part of
 COLMAP; on this machine it blocks the unsigned `libcurl.dll` in `vendor\colmap\bin`. The
 CodeIntegrity event log (Event Viewer → Applications and Services → Microsoft → Windows →
-CodeIntegrity → Operational) names the file. Smart App Control cannot allow single programs;
-turning it off is a system-wide decision (and cannot be undone without reinstalling Windows),
-so it is yours to make. Until COLMAP can run, scans can be captured but not reconstructed.
+CodeIntegrity → Operational) names the file. Smart App Control cannot allow single programs.
+Your options: report the file as a false positive at
+<https://www.microsoft.com/wdsi/filesubmission> (the block can lift once its reputation
+improves), or turn Smart App Control off under Windows Security → App & browser control. That
+is a system-wide decision. Recent Windows 11 builds let you switch it back on in the same place;
+older ones needed a reinstall. Until COLMAP can run, scans can be captured but not
+reconstructed.
 
 **"Not enough images"** — scan for longer. Below 12 accepted frames the app will not even try.
 

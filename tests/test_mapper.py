@@ -2012,6 +2012,19 @@ def completed_find_scan(manager: ScanManager, scene: Path, record: dict | None =
     return session
 
 
+def test_uncertainty_adds_the_model_allowance_to_the_marker_statistics():
+    """Full COLMAP runs erred by up to 0.23% while the spreads read ~0.01%: the ± must not
+    fall to the spreads alone."""
+    from backend.report import scale_uncertainty_pct
+
+    allowance = config.SCALE_MODEL_ALLOWANCE_PCT
+    tight = {"status": "scaled", "spreadPct": 0.01, "bootstrapPct": 0.009}
+    assert scale_uncertainty_pct(tight) == pytest.approx(allowance, abs=1e-3)
+    loose = {"status": "scaled", "spreadPct": 0.4, "bootstrapPct": 0.1}
+    assert scale_uncertainty_pct(loose) == pytest.approx((0.4**2 + allowance**2) ** 0.5, abs=1e-3)
+    assert scale_uncertainty_pct({"status": "no_markers"}) is None
+
+
 def test_scale_endpoints_remeasure_with_a_new_marker_size(client, find_scene):
     folder, truth = find_scene
     session = completed_find_scan(client.manager, folder, measure=False)
@@ -2019,7 +2032,7 @@ def test_scale_endpoints_remeasure_with_a_new_marker_size(client, find_scene):
 
     measured = client.post(f"/api/scans/{session.id}/scale", json={"markerSizeMm": 29.4}).json()
     assert measured["status"] == "scaled" and measured["markerSizeMm"] == 29.4
-    assert measured["uncertaintyPct"] == max(measured["spreadPct"], measured["bootstrapPct"])
+    assert measured["uncertaintyPct"] >= config.SCALE_MODEL_ALLOWANCE_PCT
     assert measured["mmPerUnit"] == pytest.approx(29.4 / 30 / truth["model"]["unitsPerScene"], rel=5e-4)
     stored = json.loads(session.manifest_path.read_text())
     assert stored["scale"]["mmPerUnit"] == measured["mmPerUnit"] and stored["markerSizeMm"] == 29.4
