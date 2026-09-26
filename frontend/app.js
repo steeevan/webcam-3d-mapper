@@ -1235,11 +1235,10 @@ const SCALE_REASONS = {
   not_measured: 'this scan was made before scaling existed.',
 };
 
-/** The ± shown for a scaled scan: the larger of the between-marker and bootstrap spreads. */
+/** The ± shown for a scaled scan, as the server computed it (statistics plus model allowance). */
 function uncertaintyOf(status) {
-  const scale = status?.scale;
-  if (scale?.status !== 'scaled') return null;
-  return status.scaleUncertaintyPct ?? Math.max(scale.spreadPct || 0, scale.bootstrapPct || 0);
+  if (status?.scale?.status !== 'scaled') return null;
+  return status.scaleUncertaintyPct ?? null;
 }
 
 /** Top-right badge: the measured scale with its uncertainty, or why there is none. */
@@ -1255,7 +1254,7 @@ function renderScale(status) {
     head.textContent = 'Scaled';
     badge.append(
       head,
-      ` ± ${sig2(uncertaintyOf(status))}% · ${scale.markersUsed} markers, ${scale.framesUsed} frames` +
+      `${uncertaintyOf(status) === null ? '' : ` ± ${sig2(uncertaintyOf(status))}%`} · ${scale.markersUsed} markers, ${scale.framesUsed} frames` +
         (scale.markerSizeMm !== 30 ? ` · ${scale.markerSizeMm} mm markers` : ''),
     );
     for (const warning of scale.warnings || []) {
@@ -1307,12 +1306,13 @@ function renderMeasure({ picks, mm, missed }) {
       : picks === 1 ? 'Click the second point' : 'Click the first point';
     return;
   }
-  const pct = uncertaintyOf(state.result) ?? 0;
+  const pct = uncertaintyOf(state.result);
   const value = document.createElement('b');
   value.textContent = `${formatMm(mm)} mm`;
   box.append(
     value,
-    ` ± ${sig2((mm * pct) / 100 || 0)} mm (scale only) · between two reconstructed points · click again to restart`,
+    (pct === null ? '' : ` ± ${sig2((mm * pct) / 100 || 0)} mm (scale only)`) +
+      ' · between two reconstructed points · click again to restart',
   );
 }
 

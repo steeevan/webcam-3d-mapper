@@ -158,8 +158,9 @@ def main() -> int:
                 "trueMmPerUnit": true_scale,
                 "poseRmsMm": pose_rms,
                 "seconds": round(outcome["seconds"], 1),
-                **{k: scale.get(k) for k in ("mmPerUnit", "spreadPct", "edgeCheckPct",
+                **{k: scale.get(k) for k in ("mmPerUnit", "spreadPct", "bootstrapPct", "edgeCheckPct",
                                              "markersUsed", "framesUsed", "reprojectionErrorPx")},
+                "uncertaintyPct": scale_uncertainty_pct(scale),
             }
             if scale.get("status") == "scaled":
                 row["errorPct"] = 100.0 * (scale["mmPerUnit"] / true_scale - 1.0)
